@@ -1,0 +1,10 @@
+fastapi
+uvicorn
+supabase
+langchain-text-splitters
+google-api-python-client
+google-auth
+pypdf
+requests
+python-dotenv
+
