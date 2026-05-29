@@ -399,17 +399,6 @@ COURSE MATERIALS FROM MR MAGED:
 
 
 # --- Routes ---
-@app.post("/webhook")
-async def webhook(request: Request, background_tasks: BackgroundTasks):
-    try:
-        data = await request.json()
-        msg = data.get("message", {})
-        chat_id = msg.get("chat", {}).get("id")
-        text = msg.get("text", "")
-
-        if not chat_id:
-            return JSONResponse({"ok": True})
-
 def process_telegram_message(chat_id, text, msg_info):
     try:
         # Check for contact sharing
