@@ -410,11 +410,13 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
         if not chat_id:
             return JSONResponse({"ok": True})
 
+def process_telegram_message(chat_id, text, msg_info):
+    try:
         # Check for contact sharing
-        if "contact" in msg:
-            phone = msg["contact"].get("phone_number")
-            first_name = msg.get("from", {}).get("first_name", "")
-            username = msg.get("from", {}).get("username", "")
+        if "contact" in msg_info:
+            phone = msg_info["contact"].get("phone_number")
+            first_name = msg_info.get("from", {}).get("first_name", "")
+            username = msg_info.get("from", {}).get("username", "")
             
             try:
                 supabase.table("bot_users").upsert({
@@ -428,10 +430,10 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
             
             remove_kb = {"remove_keyboard": True}
             send_telegram_keyboard(chat_id, "تم تأكيد رقم تليفونك بنجاح! البوت متاح ليك دلوقتي، وتقدر تسأل أي سؤال في المنهج.", remove_kb)
-            return JSONResponse({"ok": True})
+            return
 
         if not text:
-            return JSONResponse({"ok": True})
+            return
 
         # Check if user is registered and has phone
         user_check = supabase.table("bot_users").select("phone_number").eq("chat_id", chat_id).execute()
@@ -449,7 +451,7 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
                     keyboard)
             else:
                 send_telegram(chat_id, "أهلاً بك مجدداً! تفضل اسألني في المنهج.")
-            return JSONResponse({"ok": True})
+            return
 
         if not has_phone:
             keyboard = {
@@ -458,18 +460,17 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
                 "one_time_keyboard": True
             }
             send_telegram_keyboard(chat_id, "عفواً، لازم تشارك رقم التليفون الأول عشان أقدر أجاوبك.", keyboard)
-            return JSONResponse({"ok": True})
+            return
 
         # Restrict all commands (except /start) to admins only
         if text.startswith("/") and text != "/start":
             if chat_id not in ADMIN_CHAT_IDS:
                 send_telegram(chat_id, "عفواً، ليس لديك صلاحية لاستخدام هذا الأمر.")
-                return JSONResponse({"ok": True})
-                
+                return
+
         if text == "/restore":
-            # Run sync in background so we don't timeout the webhook
-            background_tasks.add_task(run_sync_logic, chat_id)
-            return JSONResponse({"ok": True})
+            run_sync_logic(chat_id)
+            return
 
         if text == "/files":
             try:
@@ -494,37 +495,19 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
             except Exception as e:
                 print("Failed to fetch files:", e)
                 send_telegram(chat_id, "عذراً، حصل مشكلة في جلب قائمة الملفات.")
-            return JSONResponse({"ok": True})
+            return
 
         # Send typing indicator then process
         send_telegram_typing(chat_id)
         answer = get_rag_response(chat_id, text, "chat_history", "chat_id")
         send_telegram(chat_id, answer)
-        return JSONResponse({"ok": True})
 
     except Exception as e:
-        print(f"Webhook error: {e}")
-        if chat_id:
-            send_telegram(chat_id, f"عذراً، حصل خطأ تقني: {str(e)}")
-        return JSONResponse({"status": "error", "detail": str(e)})
+        print(f"Telegram processing error: {e}")
+        send_telegram(chat_id, f"عذراً، حصل خطأ تقني: {str(e)}")
 
-@app.get("/whatsapp-webhook")
-async def verify_whatsapp_webhook(request: Request):
-    """Webhook verification for Meta."""
-    mode = request.query_params.get("hub.mode")
-    token = request.query_params.get("hub.verify_token")
-    challenge = request.query_params.get("hub.challenge")
-
-    if mode and token:
-        if mode == "subscribe" and token == WHATSAPP_VERIFY_TOKEN:
-            return PlainTextResponse(content=challenge)
-    return JSONResponse({"status": "error"}, status_code=403)
-
-@app.post("/whatsapp-webhook")
-async def receive_whatsapp_webhook(request: Request):
+def process_whatsapp_message(data):
     try:
-        data = await request.json()
-        
         if "object" in data and data["object"] == "whatsapp_business_account":
             for entry in data.get("entry", []):
                 for change in entry.get("changes", []):
@@ -560,7 +543,44 @@ async def receive_whatsapp_webhook(request: Request):
                             print(f"[WA] Got answer, sending to {phone}...")
                             send_whatsapp(phone, answer)
                             print(f"[WA] send_whatsapp completed for {phone}")
-                            
+    except Exception as e:
+        print(f"WA processing error: {e}")
+
+@app.post("/webhook")
+async def webhook(request: Request, background_tasks: BackgroundTasks):
+    try:
+        data = await request.json()
+        msg = data.get("message", {})
+        chat_id = msg.get("chat", {}).get("id")
+        text = msg.get("text", "")
+
+        if not chat_id:
+            return JSONResponse({"ok": True})
+            
+        # Process message in background to avoid blocking event loop and timeout
+        background_tasks.add_task(process_telegram_message, chat_id, text, msg)
+        return JSONResponse({"ok": True})
+    except Exception as e:
+        print(f"Webhook error: {e}")
+        return JSONResponse({"status": "error", "detail": str(e)})
+
+@app.get("/whatsapp-webhook")
+async def verify_whatsapp_webhook(request: Request):
+    """Webhook verification for Meta."""
+    mode = request.query_params.get("hub.mode")
+    token = request.query_params.get("hub.verify_token")
+    challenge = request.query_params.get("hub.challenge")
+
+    if mode and token:
+        if mode == "subscribe" and token == WHATSAPP_VERIFY_TOKEN:
+            return PlainTextResponse(content=challenge)
+    return JSONResponse({"status": "error"}, status_code=403)
+
+@app.post("/whatsapp-webhook")
+async def receive_whatsapp_webhook(request: Request, background_tasks: BackgroundTasks):
+    try:
+        data = await request.json()
+        background_tasks.add_task(process_whatsapp_message, data)
         return JSONResponse({"ok": True})
     except Exception as e:
         print(f"WA Webhook error: {e}")
