@@ -484,6 +484,7 @@ COURSE MATERIALS:
                 current_ollama_key_index = (current_ollama_key_index + 1) % len(OLLAMA_KEYS)
             continue
     
+    import re
     # 1. Remove block tags + their content (model internal reasoning)
     block_tags = r'<(?:thinking|thought|reasoning|reflect|internal|scratchpad|meta|plan|analysis|step_by_step|chain_of_thought|inner_monologue)>.*?</(?:thinking|thought|reasoning|reflect|internal|scratchpad|meta|plan|analysis|step_by_step|chain_of_thought|inner_monologue)>'
     answer = re.sub(block_tags, '', answer, flags=re.DOTALL | re.IGNORECASE).strip()
