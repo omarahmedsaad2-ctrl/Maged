@@ -6,6 +6,10 @@ on:
     # Auto-restart every 5 hours 50 minutes
     - cron: '50 */6 * * *'
 
+concurrency:
+  group: bot-server
+  cancel-in-progress: true
+
 jobs:
   run-bot:
     runs-on: ubuntu-latest
@@ -41,6 +45,8 @@ jobs:
           WHATSAPP_TOKEN: ${{ secrets.WHATSAPP_TOKEN }}
           WHATSAPP_PHONE_ID: ${{ secrets.WHATSAPP_PHONE_ID }}
           WHATSAPP_VERIFY_TOKEN: ${{ secrets.WHATSAPP_VERIFY_TOKEN }}
+          META_APP_ID: ${{ secrets.META_APP_ID }}
+          META_APP_SECRET: ${{ secrets.META_APP_SECRET }}
         run: |
           # Start uvicorn in background
           python -m uvicorn api.index:app --host 0.0.0.0 --port 8000 &
@@ -54,15 +60,24 @@ jobs:
           TUNNEL_URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' cloudflared.log | head -1)
           echo "Tunnel URL: $TUNNEL_URL"
 
-          # Set Telegram webhook
+          # Set Telegram webhook automatically
           curl -s "$TUNNEL_URL/set-webhook"
           echo ""
           echo "Telegram webhook set!"
 
-          # Print WhatsApp webhook URL for manual setup
+          # Set WhatsApp webhook automatically via Meta Graph API
+          echo "Setting WhatsApp webhook..."
+          WA_RESULT=$(curl -s -X POST "https://graph.facebook.com/v25.0/$META_APP_ID/subscriptions" \
+            -d "object=whatsapp_business_account" \
+            -d "callback_url=$TUNNEL_URL/whatsapp-webhook" \
+            -d "verify_token=$WHATSAPP_VERIFY_TOKEN" \
+            -d "fields=messages" \
+            -d "access_token=${META_APP_ID}|${META_APP_SECRET}")
+          echo "WhatsApp webhook result: $WA_RESULT"
+
           echo "========================================"
-          echo "WhatsApp Webhook URL: $TUNNEL_URL/whatsapp-webhook"
-          echo "Verify Token: maged_bot_secure_token"
+          echo "Both webhooks set automatically!"
+          echo "Tunnel: $TUNNEL_URL"
           echo "========================================"
 
           # Keep alive for ~5 hours 50 minutes then auto-restart
