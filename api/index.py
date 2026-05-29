@@ -505,8 +505,11 @@ COURSE MATERIALS:
     return answer
 
 
-# --- Process Messages (async) ---
-async def process_telegram_message(chat_id, text, msg_info):
+# --- Process Telegram (inline - returns response dict for webhook reply) ---
+async def process_telegram_inline(chat_id, text, msg_info):
+    """Process Telegram message and return a webhook response dict.
+    Since api.telegram.org is blocked from HF Spaces, we return the reply
+    directly in the webhook response body (Telegram supports this)."""
     print(f"[TG] >>> Processing msg from {chat_id}: '{text[:50]}'", flush=True)
     try:
         # Check for contact sharing
@@ -525,12 +528,16 @@ async def process_telegram_message(chat_id, text, msg_info):
             except Exception as e:
                 print("Failed to save user:", e, flush=True)
 
-            remove_kb = {"remove_keyboard": True}
-            await send_telegram_keyboard(chat_id, "Hi welcome to Mr Maged's bot! 🎓\n\nHere you can feel free to ask any question you want and don't worry, I'm always here to help you 😊", remove_kb)
-            return
+            print(f"[TG] Contact saved for {chat_id}, sending welcome", flush=True)
+            return {
+                "method": "sendMessage",
+                "chat_id": chat_id,
+                "text": "Hi welcome to Mr Maged's bot! 🎓\n\nHere you can feel free to ask any question you want and don't worry, I'm always here to help you 😊",
+                "reply_markup": {"remove_keyboard": True}
+            }
 
         if not text:
-            return
+            return None
 
         # Check if user is registered and has phone
         print(f"[TG] Checking user registration for {chat_id}...", flush=True)
@@ -545,12 +552,18 @@ async def process_telegram_message(chat_id, text, msg_info):
                     "resize_keyboard": True,
                     "one_time_keyboard": True
                 }
-                await send_telegram_keyboard(chat_id,
-                    "Hi welcome to Mr Maged's bot! 🎓\n\nHere you can feel free to ask any question you want and don't worry, I'm always here to help you 😊\n\nPlease share your phone number first by pressing the button below:",
-                    keyboard)
+                return {
+                    "method": "sendMessage",
+                    "chat_id": chat_id,
+                    "text": "Hi welcome to Mr Maged's bot! 🎓\n\nHere you can feel free to ask any question you want and don't worry, I'm always here to help you 😊\n\nPlease share your phone number first by pressing the button below:",
+                    "reply_markup": keyboard
+                }
             else:
-                await send_telegram(chat_id, "Hi welcome back! 🎓\n\nFeel free to ask me anything about English, I'm always here to help you 😊")
-            return
+                return {
+                    "method": "sendMessage",
+                    "chat_id": chat_id,
+                    "text": "Hi welcome back! 🎓\n\nFeel free to ask me anything about English, I'm always here to help you 😊"
+                }
 
         if not has_phone:
             keyboard = {
@@ -558,15 +571,22 @@ async def process_telegram_message(chat_id, text, msg_info):
                 "resize_keyboard": True,
                 "one_time_keyboard": True
             }
-            await send_telegram_keyboard(chat_id, "عفواً، لازم تشارك رقم التليفون الأول عشان أقدر أجاوبك.", keyboard)
-            return
+            return {
+                "method": "sendMessage",
+                "chat_id": chat_id,
+                "text": "عفواً، لازم تشارك رقم التليفون الأول عشان أقدر أجاوبك.",
+                "reply_markup": keyboard
+            }
 
-        # /review command - available for ALL users
+        # /review command
         if text.startswith("/review"):
             review_text = text[7:].strip()
             if not review_text:
-                await send_telegram(chat_id, "📝 To leave a review, type:\n/review followed by your feedback\n\nExample:\n/review The bot is very helpful!")
-                return
+                return {
+                    "method": "sendMessage",
+                    "chat_id": chat_id,
+                    "text": "📝 To leave a review, type:\n/review followed by your feedback\n\nExample:\n/review The bot is very helpful!"
+                }
             try:
                 first_name = msg_info.get("from", {}).get("first_name", "")
                 await db(lambda: supabase.table("reviews").insert({
@@ -575,21 +595,36 @@ async def process_telegram_message(chat_id, text, msg_info):
                     "user_name": first_name,
                     "review": review_text
                 }).execute())
-                await send_telegram(chat_id, "Thank you so much for your feedback! 🙏😊\nYour review has been saved successfully ✅")
+                return {
+                    "method": "sendMessage",
+                    "chat_id": chat_id,
+                    "text": "Thank you so much for your feedback! 🙏😊\nYour review has been saved successfully ✅"
+                }
             except Exception as e:
                 print(f"Failed to save review: {e}", flush=True)
-                await send_telegram(chat_id, "Sorry, something went wrong. Please try again later.")
-            return
+                return {
+                    "method": "sendMessage",
+                    "chat_id": chat_id,
+                    "text": "Sorry, something went wrong. Please try again later."
+                }
 
-        # Restrict all commands (except /start and /review) to admins only
+        # Admin commands
         if text.startswith("/") and text not in ["/start"]:
             if chat_id not in ADMIN_CHAT_IDS:
-                await send_telegram(chat_id, "عفواً، ليس لديك صلاحية لاستخدام هذا الأمر.")
-                return
+                return {
+                    "method": "sendMessage",
+                    "chat_id": chat_id,
+                    "text": "عفواً، ليس لديك صلاحية لاستخدام هذا الأمر."
+                }
 
         if text == "/restore":
-            await run_sync_logic(chat_id)
-            return
+            # Start sync in background, return immediate confirmation
+            asyncio.create_task(run_sync_logic(chat_id))
+            return {
+                "method": "sendMessage",
+                "chat_id": chat_id,
+                "text": "⏳ جاري بدء عملية المزامنة... سيتم إبلاغك عند الانتهاء."
+            }
 
         if text == "/files":
             try:
@@ -610,26 +645,24 @@ async def process_telegram_message(chat_id, text, msg_info):
                 else:
                     files_msg = "مفيش ملفات موجودة حالياً."
 
-                await send_telegram(chat_id, files_msg)
+                return {"method": "sendMessage", "chat_id": chat_id, "text": files_msg}
             except Exception as e:
                 print("Failed to fetch files:", e, flush=True)
-                await send_telegram(chat_id, "عذراً، حصل مشكلة في جلب قائمة الملفات.")
-            return
+                return {"method": "sendMessage", "chat_id": chat_id, "text": "عذراً، حصل مشكلة في جلب قائمة الملفات."}
 
-        # Send typing indicator then process
-        await send_telegram_typing(chat_id)
+        # Normal message — get RAG response
         print(f"[TG] Getting RAG response for {chat_id}...", flush=True)
         answer = await get_rag_response(chat_id, text, "chat_history", "chat_id")
-        print(f"[TG] Got answer ({len(answer)} chars), sending to {chat_id}...", flush=True)
-        await send_telegram(chat_id, answer)
-        print(f"[TG] <<< Done for {chat_id}", flush=True)
+        print(f"[TG] Got answer ({len(answer)} chars), returning inline to {chat_id}", flush=True)
+        return {"method": "sendMessage", "chat_id": chat_id, "text": answer}
 
     except Exception as e:
         print(f"[TG] !!! Processing error for {chat_id}: {e}", flush=True)
-        try:
-            await send_telegram(chat_id, f"عذراً، حصل خطأ تقني: {str(e)[:200]}")
-        except Exception as e2:
-            print(f"[TG] !!! Failed to send error msg too: {e2}", flush=True)
+        return {
+            "method": "sendMessage",
+            "chat_id": chat_id,
+            "text": f"عذراً، حصل خطأ تقني. حاول تاني."
+        }
 
 
 async def process_whatsapp_message(data):
@@ -726,12 +759,17 @@ async def webhook(request: Request):
         if not chat_id:
             return JSONResponse({"ok": True})
 
-        # Fire and forget — async task on the event loop (no threadpool needed)
-        asyncio.create_task(process_telegram_message(chat_id, text, msg))
+        # Process inline and return reply in webhook response body
+        # (api.telegram.org is blocked from HF Spaces, so we use this Telegram-supported method)
+        reply = await process_telegram_inline(chat_id, text, msg)
+        if reply:
+            print(f"[TG] Returning inline reply for {chat_id}", flush=True)
+            return JSONResponse(reply)
+
         return JSONResponse({"ok": True})
     except Exception as e:
         print(f"Webhook error: {e}", flush=True)
-        return JSONResponse({"status": "error", "detail": str(e)})
+        return JSONResponse({"ok": True})
 
 
 @app.get("/whatsapp-webhook")
