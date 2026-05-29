@@ -260,8 +260,22 @@ def send_whatsapp(to_phone, text):
         except Exception as e:
             print(f"Failed to send WA message: {e}")
 
+GREETINGS = {"hi", "hello", "hey", "هلا", "اهلا", "مرحبا", "هاي", "السلام عليكم", "ازيك", "ازيكم", "صباح الخير", "مساء الخير", "يا مستر", "مستر"}
+
 def get_rag_response(user_id, text, history_table, user_column):
-    similar_docs = search_similar(text, limit=12)
+    # Smart: skip RAG search for greetings/short messages
+    text_lower = text.strip().lower()
+    is_greeting = text_lower in GREETINGS or len(text_lower) < 4
+    
+    if is_greeting:
+        similar_docs = []
+        print(f"[SMART] Skipped RAG for greeting: '{text_lower}'")
+    else:
+        # Use fewer docs for short questions, more for complex ones
+        doc_limit = 5 if len(text) < 30 else 10
+        similar_docs = search_similar(text, limit=doc_limit)
+        print(f"[SMART] RAG search with {doc_limit} docs for: '{text[:40]}'")
+
 
     def get_source(d):
         meta = d.get('metadata', {})
@@ -335,11 +349,13 @@ COURSE MATERIALS FROM MR MAGED:
 {context}
 """
 
+    # Smart history: fewer messages for greetings, more for real questions
+    history_limit = 6 if is_greeting else 15
     history = []
     try:
-        history_response = supabase.table(history_table).select("role, content").eq(user_column, user_id).order("created_at", desc=True).limit(40).execute()
+        history_response = supabase.table(history_table).select("role, content").eq(user_column, user_id).order("created_at", desc=True).limit(history_limit).execute()
         history = list(reversed(history_response.data))
-        print(f"[HISTORY] Loaded {len(history)} messages for {user_id} from {history_table}")
+        print(f"[HISTORY] Loaded {len(history)}/{history_limit} messages for {user_id}")
     except Exception as e:
         print("Failed to fetch chat history:", e)
 
