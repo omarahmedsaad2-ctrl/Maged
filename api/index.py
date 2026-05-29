@@ -8,6 +8,7 @@ import os
 import io
 import json
 import time
+import sys
 import requests
 from fastapi import FastAPI, Request, BackgroundTasks
 from fastapi.responses import JSONResponse, PlainTextResponse
@@ -436,6 +437,7 @@ COURSE MATERIALS FROM MR MAGED:
 
 # --- Routes ---
 def process_telegram_message(chat_id, text, msg_info):
+    print(f"[TG] >>> Processing msg from {chat_id}: '{text[:50]}'", flush=True)
     try:
         # Check for contact sharing
         if "contact" in msg_info:
@@ -524,14 +526,21 @@ def process_telegram_message(chat_id, text, msg_info):
 
         # Send typing indicator then process
         send_telegram_typing(chat_id)
+        print(f"[TG] Getting RAG response for {chat_id}...", flush=True)
         answer = get_rag_response(chat_id, text, "chat_history", "chat_id")
+        print(f"[TG] Got answer ({len(answer)} chars), sending to {chat_id}...", flush=True)
         send_telegram(chat_id, answer)
+        print(f"[TG] <<< Done for {chat_id}", flush=True)
 
     except Exception as e:
-        print(f"Telegram processing error: {e}")
-        send_telegram(chat_id, f"عذراً، حصل خطأ تقني: {str(e)}")
+        print(f"[TG] !!! Processing error for {chat_id}: {e}", flush=True)
+        try:
+            send_telegram(chat_id, f"عذراً، حصل خطأ تقني: {str(e)[:200]}")
+        except Exception as e2:
+            print(f"[TG] !!! Failed to send error msg too: {e2}", flush=True)
 
 def process_whatsapp_message(data):
+    print(f"[WA] >>> Processing incoming WA data", flush=True)
     try:
         if "object" in data and data["object"] == "whatsapp_business_account":
             for entry in data.get("entry", []):
