@@ -350,12 +350,12 @@ IDENTITY:
 - You know exactly what content you have. When asked, list available topics briefly.
 
 LANGUAGE RULES (HIGHEST PRIORITY):
-- If the student writes in Arabic → reply in Egyptian Arabic (عامية مصرية) BUT naturally mix in English words and short phrases (A2-B1 level). You are an English tutor, so ALWAYS weave English into your Arabic replies to help the student learn. Examples:
-  "بص يا بطل، الـ present simple بنستخدمه for habits and routines يعني حاجات بتحصل always"
-  "الكلمة دي meaning بتاعها هي..."
-  "Try to think about it كده... لو عايز تقول إنك بتعمل حاجة every day بتستخدم..."
-- If the student writes in English → reply ENTIRELY in English. Be friendly, natural, and encouraging.
-- Grammar terms and English vocabulary ALWAYS stay in English regardless of reply language.
+- If the student writes in Arabic → reply using a MIX where at least 60% of the message is in English. Use Egyptian Arabic only as short connectors and encouragements between English content. You are an English immersion tutor — push the student to absorb English naturally. Examples:
+  "بص يا بطل، the present simple is used for habits and daily routines, يعني things you do regularly like: I wake up at 7, I go to school every day. Notice how the verb stays in its base form ركز في النقطة دي كويس"
+  "الكلمة دي means 'opportunity' — it's when you have a chance to do something. For example: This is a great opportunity to improve your English. فاهم يا بطل؟"
+  "Let me explain it simply كده... When you want to talk about something happening right now, you use the present continuous: subject + am/is/are + verb-ing. مثال: I am studying English right now"
+- If the student writes in English → reply ENTIRELY in English at a B2 to C2+ level. Use rich vocabulary, varied sentence structures, idiomatic expressions, and natural academic English. Challenge the student to level up.
+- Grammar terms, vocabulary, definitions, and examples MUST always be in English regardless of reply language.
 
 MEMORY:
 - You HAVE full conversation memory. The previous messages are REAL past messages with this specific student. 
@@ -365,6 +365,11 @@ PERSONALITY:
 - Act exactly like MR Maged: relaxed, friendly, encouraging Egyptian English teacher.
 - Give the core concept simply and directly. No textbook essays.
 - Explain step by step using MR Maged's style and his exact words from the materials.
+- GENDER AWARENESS: Detect the student's gender from their name or how they talk. Use the correct masculine or feminine forms in Arabic:
+  📌 For boys: "بص يا بطل", "ركز معايا يا كبير", "يا بطبوط", "يا معلم", "برافو عليك"
+  📌 For girls: "بصي يا بطلة", "ركزي معايا يا قمر", "يا كتكوتة", "يا ستي", "برافو عليكي"
+  📌 Verb forms: use masculine (بتستخدم، عايز، فاهم) for boys, feminine (بتستخدمي، عايزة، فاهمة) for girls.
+  📌 If unsure about gender, use gender-neutral terms like "يا فندم" or "يا صديقي".
 
 RESPONSE FORMAT (CRITICAL - you are on Telegram/WhatsApp):
 - Keep answers SHORT and conversational. Max 2-3 examples at a time.
@@ -468,7 +473,7 @@ def process_telegram_message(chat_id, text, msg_info):
                 print("Failed to save user:", e)
             
             remove_kb = {"remove_keyboard": True}
-            send_telegram_keyboard(chat_id, "تم تأكيد رقم تليفونك بنجاح! البوت متاح ليك دلوقتي، وتقدر تسأل أي سؤال في المنهج.", remove_kb)
+            send_telegram_keyboard(chat_id, "Hi welcome to Mr Maged's bot! 🎓\n\nHere you can feel free to ask any question you want and don't worry, I'm always here to help you 😊", remove_kb)
             return
 
         if not text:
@@ -486,10 +491,10 @@ def process_telegram_message(chat_id, text, msg_info):
                     "one_time_keyboard": True
                 }
                 send_telegram_keyboard(chat_id, 
-                    "أهلاً بيك! أنا مساعد مستر ماجد.\nعشان أقدر أساعدك، يرجى الضغط على الزرار بالأسفل لمشاركة رقم هاتفك:", 
+                    "Hi welcome to Mr Maged's bot! 🎓\n\nHere you can feel free to ask any question you want and don't worry, I'm always here to help you 😊\n\nPlease share your phone number first by pressing the button below:", 
                     keyboard)
             else:
-                send_telegram(chat_id, "أهلاً بك مجدداً! تفضل اسألني في المنهج.")
+                send_telegram(chat_id, "Hi welcome back! 🎓\n\nFeel free to ask me anything about English, I'm always here to help you 😊")
             return
 
         if not has_phone:
@@ -501,8 +506,28 @@ def process_telegram_message(chat_id, text, msg_info):
             send_telegram_keyboard(chat_id, "عفواً، لازم تشارك رقم التليفون الأول عشان أقدر أجاوبك.", keyboard)
             return
 
-        # Restrict all commands (except /start) to admins only
-        if text.startswith("/") and text != "/start":
+        # /review command - available for ALL users
+        if text.startswith("/review"):
+            review_text = text[7:].strip()
+            if not review_text:
+                send_telegram(chat_id, "📝 To leave a review, type:\n/review followed by your feedback\n\nExample:\n/review The bot is very helpful!")
+                return
+            try:
+                first_name = msg_info.get("from", {}).get("first_name", "")
+                supabase.table("reviews").insert({
+                    "platform": "telegram",
+                    "user_id": str(chat_id),
+                    "user_name": first_name,
+                    "review": review_text
+                }).execute()
+                send_telegram(chat_id, "Thank you so much for your feedback! 🙏😊\nYour review has been saved successfully ✅")
+            except Exception as e:
+                print(f"Failed to save review: {e}", flush=True)
+                send_telegram(chat_id, "Sorry, something went wrong. Please try again later.")
+            return
+
+        # Restrict all commands (except /start and /review) to admins only
+        if text.startswith("/") and text not in ["/start"]:
             if chat_id not in ADMIN_CHAT_IDS:
                 send_telegram(chat_id, "عفواً، ليس لديك صلاحية لاستخدام هذا الأمر.")
                 return
@@ -585,6 +610,34 @@ def process_whatsapp_message(data):
                                 print("Failed to save WA user:", e)
 
                             print(f"[WA] Processing message from {phone}: {text[:50]}")
+
+                            # Handle /review command on WhatsApp
+                            if text.strip().lower().startswith("/review"):
+                                review_text = text[7:].strip()
+                                if not review_text:
+                                    send_whatsapp(phone, "📝 To leave a review, send:\n/review followed by your feedback\n\nExample:\n/review The bot is very helpful!")
+                                else:
+                                    try:
+                                        supabase.table("reviews").insert({
+                                            "platform": "whatsapp",
+                                            "user_id": phone,
+                                            "user_name": contact_name,
+                                            "review": review_text
+                                        }).execute()
+                                        send_whatsapp(phone, "Thank you so much for your feedback! 🙏😊\nYour review has been saved successfully ✅")
+                                    except Exception as e:
+                                        print(f"Failed to save WA review: {e}", flush=True)
+                                        send_whatsapp(phone, "Sorry, something went wrong. Please try again later.")
+                                continue
+
+                            # Check if first message (welcome)
+                            try:
+                                wa_history = supabase.table("whatsapp_chat_history").select("id").eq("phone_number", phone).limit(1).execute()
+                                if not wa_history.data:
+                                    send_whatsapp(phone, "Hi welcome to Mr Maged's bot! 🎓\n\nHere you can feel free to ask any question you want and don't worry, I'm always here to help you 😊")
+                            except:
+                                pass
+
                             answer = get_rag_response(phone, text, "whatsapp_chat_history", "phone_number")
                             print(f"[WA] Got answer, sending to {phone}...")
                             send_whatsapp(phone, answer)
