@@ -412,10 +412,12 @@ COURSE MATERIALS FROM MR MAGED:
     import re
     answer = response.json().get("message", {}).get("content", "Sorry, I couldn't generate an answer.")
     
-    # Strip thinking/reasoning tags that some models output
-    answer = re.sub(r'<thinking>.*?</thinking>', '', answer, flags=re.DOTALL).strip()
-    answer = re.sub(r'<thought>.*?</thought>', '', answer, flags=re.DOTALL).strip()
-    answer = re.sub(r'<reasoning>.*?</reasoning>', '', answer, flags=re.DOTALL).strip()
+    # 1. Remove block tags + their content (model internal reasoning)
+    block_tags = r'<(?:thinking|thought|reasoning|reflect|internal|scratchpad|meta|plan|analysis|step_by_step|chain_of_thought|inner_monologue)>.*?</(?:thinking|thought|reasoning|reflect|internal|scratchpad|meta|plan|analysis|step_by_step|chain_of_thought|inner_monologue)>'
+    answer = re.sub(block_tags, '', answer, flags=re.DOTALL | re.IGNORECASE).strip()
+    
+    # 2. Remove any remaining XML/HTML-style tags but keep their text content
+    answer = re.sub(r'<[^>]+>', '', answer).strip()
     
     if not answer:
         answer = "عذراً، لم أتمكن من إنشاء إجابة. حاول مرة أخرى."
