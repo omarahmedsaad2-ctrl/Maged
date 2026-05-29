@@ -673,86 +673,119 @@ async def process_telegram_inline(chat_id, text, msg_info):
         }
 
 
+# --- Message Deduplication Cache ---
+_processed_msg_ids = set()
+_MAX_CACHE = 500
+
+
+def _is_duplicate(msg_id):
+    """Check if message was already processed. Returns True if duplicate."""
+    global _processed_msg_ids
+    if msg_id in _processed_msg_ids:
+        return True
+    _processed_msg_ids.add(msg_id)
+    # Trim cache to prevent memory leak
+    if len(_processed_msg_ids) > _MAX_CACHE:
+        _processed_msg_ids = set(list(_processed_msg_ids)[-200:])
+    return False
+
+
 async def process_whatsapp_message(data):
-    print(f"[WA] >>> Processing incoming WA data", flush=True)
+    """Process WhatsApp webhook per Meta docs - filter by field, deduplicate, handle messages only."""
     try:
-        if "object" in data and data["object"] == "whatsapp_business_account":
-            for entry in data.get("entry", []):
-                for change in entry.get("changes", []):
-                    value = change.get("value", {})
+        if data.get("object") != "whatsapp_business_account":
+            return
 
-                    if "statuses" in value:
-                        for status in value["statuses"]:
-                            if status.get("status") == "failed":
-                                try:
-                                    await db(lambda: supabase.table("whatsapp_chat_history").insert({
-                                        "phone_number": status.get("recipient_id", "unknown"),
-                                        "role": "assistant",
-                                        "content": f"[DEBUG STATUS FAILED]: {status}"
-                                    }).execute())
-                                except:
-                                    pass
+        for entry in data.get("entry", []):
+            for change in entry.get("changes", []):
+                # Per Meta docs: only process "messages" field, skip everything else
+                field = change.get("field")
+                if field != "messages":
+                    print(f"[WA] Skipping non-message webhook (field={field})", flush=True)
+                    continue
 
-                    if "messages" in value:
-                        messages = value["messages"]
-                        contacts = value.get("contacts", [])
+                value = change.get("value", {})
 
-                        for msg in messages:
-                            if msg.get("type") != "text":
-                                continue
+                # Log failed delivery statuses (debug only)
+                if "statuses" in value:
+                    for status in value.get("statuses", []):
+                        if status.get("status") == "failed":
+                            print(f"[WA STATUS FAILED] to {status.get('recipient_id')}: {status.get('errors')}", flush=True)
+                    # If this webhook ONLY has statuses and no messages, skip
+                    if "messages" not in value:
+                        return
 
-                            phone = msg.get("from")
-                            text = msg.get("text", {}).get("body", "")
-                            msg_id = msg.get("id")
+                if "messages" not in value:
+                    return
 
-                            contact_name = contacts[0].get("profile", {}).get("name", "User") if contacts else "User"
+                messages = value["messages"]
+                contacts = value.get("contacts", [])
 
-                            # Mark as read (blue ticks) immediately
-                            await mark_whatsapp_read(msg_id)
+                for msg in messages:
+                    msg_id = msg.get("id")
 
+                    # Deduplication: Meta retries webhooks, skip already-processed messages
+                    if msg_id and _is_duplicate(f"wa_{msg_id}"):
+                        print(f"[WA] Skipping duplicate msg {msg_id}", flush=True)
+                        continue
+
+                    if msg.get("type") != "text":
+                        print(f"[WA] Skipping non-text msg type={msg.get('type')}", flush=True)
+                        continue
+
+                    phone = msg.get("from")
+                    text = msg.get("text", {}).get("body", "")
+                    contact_name = contacts[0].get("profile", {}).get("name", "User") if contacts else "User"
+
+                    print(f"[WA] Processing message from {phone}: {text[:50]}", flush=True)
+
+                    # Mark as read (blue ticks) - non-blocking
+                    asyncio.create_task(mark_whatsapp_read(msg_id))
+
+                    # Save user
+                    try:
+                        await db(lambda p=phone, cn=contact_name: supabase.table("whatsapp_users").upsert(
+                            {"phone_number": p, "name": cn},
+                            on_conflict="phone_number"
+                        ).execute())
+                    except Exception as e:
+                        print("Failed to save WA user:", e, flush=True)
+
+                    # Handle /review command
+                    if text.strip().lower().startswith("/review"):
+                        review_text = text[7:].strip()
+                        if not review_text:
+                            await send_whatsapp(phone, "📝 To leave a review, send:\n/review followed by your feedback\n\nExample:\n/review The bot is very helpful!")
+                        else:
                             try:
-                                await db(lambda p=phone, cn=contact_name: supabase.table("whatsapp_users").upsert(
-                                    {"phone_number": p, "name": cn},
-                                    on_conflict="phone_number"
-                                ).execute())
+                                await db(lambda p=phone, cn=contact_name, rt=review_text: supabase.table("reviews").insert({
+                                    "platform": "whatsapp",
+                                    "user_id": p,
+                                    "user_name": cn,
+                                    "review": rt
+                                }).execute())
+                                await send_whatsapp(phone, "Thank you so much for your feedback! 🙏😊\nYour review has been saved successfully ✅")
                             except Exception as e:
-                                print("Failed to save WA user:", e, flush=True)
+                                print(f"Failed to save WA review: {e}", flush=True)
+                                await send_whatsapp(phone, "Sorry, something went wrong. Please try again later.")
+                        continue
 
-                            print(f"[WA] Processing message from {phone}: {text[:50]}", flush=True)
+                    # Check if first message (welcome)
+                    try:
+                        wa_history = await db(lambda p=phone: supabase.table("whatsapp_chat_history").select("id").eq("phone_number", p).limit(1).execute())
+                        if not wa_history.data:
+                            await send_whatsapp(phone, "Hi welcome to Mr Maged's bot! 🎓\n\nHere you can feel free to ask any question you want and don't worry, I'm always here to help you 😊")
+                    except:
+                        pass
 
-                            # Handle /review command on WhatsApp
-                            if text.strip().lower().startswith("/review"):
-                                review_text = text[7:].strip()
-                                if not review_text:
-                                    await send_whatsapp(phone, "📝 To leave a review, send:\n/review followed by your feedback\n\nExample:\n/review The bot is very helpful!")
-                                else:
-                                    try:
-                                        await db(lambda p=phone, cn=contact_name, rt=review_text: supabase.table("reviews").insert({
-                                            "platform": "whatsapp",
-                                            "user_id": p,
-                                            "user_name": cn,
-                                            "review": rt
-                                        }).execute())
-                                        await send_whatsapp(phone, "Thank you so much for your feedback! 🙏😊\nYour review has been saved successfully ✅")
-                                    except Exception as e:
-                                        print(f"Failed to save WA review: {e}", flush=True)
-                                        await send_whatsapp(phone, "Sorry, something went wrong. Please try again later.")
-                                continue
+                    # Get RAG response and send
+                    answer = await get_rag_response(phone, text, "whatsapp_chat_history", "phone_number")
+                    print(f"[WA] Got answer ({len(answer)} chars), sending to {phone}...", flush=True)
+                    await send_whatsapp(phone, answer)
+                    print(f"[WA] <<< Done for {phone}", flush=True)
 
-                            # Check if first message (welcome)
-                            try:
-                                wa_history = await db(lambda p=phone: supabase.table("whatsapp_chat_history").select("id").eq("phone_number", p).limit(1).execute())
-                                if not wa_history.data:
-                                    await send_whatsapp(phone, "Hi welcome to Mr Maged's bot! 🎓\n\nHere you can feel free to ask any question you want and don't worry, I'm always here to help you 😊")
-                            except:
-                                pass
-
-                            answer = await get_rag_response(phone, text, "whatsapp_chat_history", "phone_number")
-                            print(f"[WA] Got answer, sending to {phone}...", flush=True)
-                            await send_whatsapp(phone, answer)
-                            print(f"[WA] <<< Done for {phone}", flush=True)
     except Exception as e:
-        print(f"WA processing error: {e}", flush=True)
+        print(f"[WA] Processing error: {e}", flush=True)
 
 
 # --- Routes ---
@@ -760,6 +793,13 @@ async def process_whatsapp_message(data):
 async def webhook(request: Request):
     try:
         data = await request.json()
+
+        # Telegram deduplication using update_id
+        update_id = data.get("update_id")
+        if update_id and _is_duplicate(f"tg_{update_id}"):
+            print(f"[TG] Skipping duplicate update {update_id}", flush=True)
+            return JSONResponse({"ok": True})
+
         msg = data.get("message", {})
         chat_id = msg.get("chat", {}).get("id")
         text = msg.get("text", "")
