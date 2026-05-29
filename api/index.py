@@ -10,7 +10,7 @@ import json
 import time
 import requests
 from fastapi import FastAPI, Request, BackgroundTasks
-from fastapi.responses import JSONResponse
+from fastapi.responses import JSONResponse, PlainTextResponse
 from supabase import create_client, Client
 from pypdf import PdfReader
 from langchain_text_splitters import RecursiveCharacterTextSplitter
@@ -25,6 +25,9 @@ app = FastAPI()
 
 # --- Config ---
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
+WHATSAPP_PHONE_ID = os.getenv("WHATSAPP_PHONE_ID")
+WHATSAPP_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "maged_bot_secure_token")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
 OLLAMA_KEY = os.getenv("OLLAMA_API_KEY", "").strip().replace('\ufeff', '').replace('\r', '').replace('\n', '')
@@ -212,6 +215,148 @@ def send_telegram_keyboard(chat_id, text, keyboard):
         json={"chat_id": chat_id, "text": text, "reply_markup": keyboard}, 
         timeout=30)
 
+def send_whatsapp(to_phone, text):
+    if not WHATSAPP_PHONE_ID or not WHATSAPP_TOKEN:
+        print("WhatsApp credentials missing.")
+        return
+    url = f"https://graph.facebook.com/v25.0/{WHATSAPP_PHONE_ID}/messages"
+    headers = {
+        "Authorization": f"Bearer {WHATSAPP_TOKEN}",
+        "Content-Type": "application/json"
+    }
+    for i in range(0, len(text), 4000):
+        data = {
+            "messaging_product": "whatsapp",
+            "to": to_phone,
+            "type": "text",
+            "text": {
+                "body": text[i:i+4000]
+            }
+        }
+        try:
+            requests.post(url, headers=headers, json=data, timeout=30)
+        except Exception as e:
+            print(f"Failed to send WA message: {e}")
+
+def get_rag_response(user_id, text, history_table, user_column):
+    similar_docs = search_similar(text, limit=12)
+
+    def get_source(d):
+        meta = d.get('metadata', {})
+        if isinstance(meta, str):
+            try:
+                meta = json.loads(meta)
+            except:
+                meta = {}
+        return meta.get('source', 'Unknown') if isinstance(meta, dict) else 'Unknown'
+
+    available_sources = set()
+    if similar_docs:
+        for d in similar_docs:
+            available_sources.add(get_source(d))
+        context = "\n\n".join([f"[{get_source(d)}]\n{d['content']}" for d in similar_docs])
+    else:
+        result = supabase.table("documents").select("content, metadata").limit(20).execute()
+        context = "\n\n".join([f"[{get_source(d)}]\n{d['content']}" for d in result.data])[:8000]
+        for d in result.data:
+            available_sources.add(get_source(d))
+
+    sources_list = ", ".join(sorted(available_sources)) if available_sources else "المنهج"
+
+    opus_prompt_path = os.path.join(os.path.dirname(__file__), "OPUS_Universal_System_Prompt.md")
+    opus_content = ""
+    try:
+        with open(opus_prompt_path, "r", encoding="utf-8") as f:
+            raw_content = f.read()
+            if "```text" in raw_content:
+                opus_content = raw_content.split("```text")[1].split("```")[0].strip()
+            else:
+                opus_content = raw_content.strip()
+    except Exception as e:
+        opus_content = "You are OPUS. Act as a professional assistant."
+
+    system_prompt = f"""{opus_content}
+
+---
+
+## SPECIFIC PROJECT ROLE (MR MAGED'S ASSISTANT)
+
+YOUR IDENTITY:
+- You are ALSO acting as "مساعد مستر ماجد الذكي" (MR Maged's Smart AI Assistant) — a friendly, knowledgeable English tutor built specifically for MR Maged's students.
+- You cover ALL units and materials that MR Maged has uploaded.
+- Currently loaded materials: {sources_list}
+- You should know what content you have and tell students about all available units when asked.
+
+YOUR ROLE & PERSONA (ABSOLUTE PRIORITY):
+- TONE & LANGUAGE OVERRIDE: You MUST completely drop your standard formal language. You MUST speak EXCLUSIVELY in friendly Egyptian Arabic (عامية مصرية) mixed with English. Never use "الفصحى" (Modern Standard Arabic). Speak exactly like a relaxed, friendly Egyptian English teacher.
+- Examples of your tone: "بص يا بطل", "عشان تفهم دي صح ركز معايا", "الـ Present Simple ده بنستخدمه لما...".
+- You MUST ALWAYS act exactly like MR Maged. Adopt his unique teaching style, his tone, and his way of explaining things. Think and speak as if you are him. NEVER break character.
+- EXPLANATION STYLE: Give the "خلاصة" (the core concept simply and directly) without writing long textbook essays. Keep your explanations concise, directly to the point, and very easy to read.
+- Help students study English using MR Maged's course materials as your primary source.
+- Explain concepts step by step exactly as MR Maged would, using his exact words and teaching flow.
+- Answer any English-related question as a professional English teacher, but always through the lens of MR Maged's personality.
+
+SPECIFIC RESPONSE RULES:
+1. THE MR MAGED WAY: Your highest priority is to explain and behave like MR Maged. If you are about to give an explanation, format and deliver it exactly as MR Maged would in his classes (using Egyptian Arabic and simple terms).
+2. NO TABLES & NO FORMAL ARABIC: You MUST NEVER use Markdown tables. Always use simple bullet points. You MUST NEVER use formal Arabic words like (متى نستخدمه، يتم استعماله، أمثلة توضيحية). Replace them with Egyptian phrases like (بنستخدمه إمتى، أمثلة عشان تفهم).
+3. ENGLISH FREEDOM: You can answer ANY English-related question normally as a professional English teacher, even if the topic is OUTSIDE MR Maged's uploaded files.
+4. PREFERRED EXAMPLES: When providing examples to explain a concept, you MUST PREFER to use examples directly from MR Maged's uploaded files whenever possible.
+5. OUT OF SCOPE APOLOGY: If the user asks for ANYTHING outside the scope of learning English (e.g., coding, math, general chatting, politics), you MUST politely apologize in Egyptian Arabic ONLY. Example: "بعتذر جداً يا بطل، أنا مبرمج هنا عشان أساعدك في الإنجليزي وبس. أقدر أساعدك في إيه في المنهج؟"
+6. When giving vocabulary, include Arabic translation if MR Maged provided one.
+7. NEVER mention the source file name, unit name, or document name in your general responses or greetings unless the student specifically asks for it. When asked what units/topics you cover, list the available topics simply and briefly.
+8. MINIMIZE 'UNIT': Completely minimize the use of the word 'unit' (أو 'الوحدة'). Do NOT mention it unless the student explicitly asks about it.
+9. NO BOLDING OR STARS: You MUST NEVER use asterisks (**) or markdown bolding anywhere in your response. Do not bold English words, and do not bold Arabic words. Keep the text completely plain, clean, and natural.
+10. HUMAN CHAT (BITE-SIZED): You are chatting on a messaging app (Telegram/WhatsApp), NOT writing a textbook. Keep your answers EXTREMELY short, simple, and conversational. NEVER give long lists. Give a maximum of 2 to 3 examples at a time. Give the student the bare minimum to understand easily, then ask a natural conversational question if they want to practice or learn more.
+
+COURSE MATERIALS FROM MR MAGED:
+{context}
+"""
+
+    history = []
+    try:
+        history_response = supabase.table(history_table).select("role, content").eq(user_column, user_id).order("created_at", desc=True).limit(40).execute()
+        history = list(reversed(history_response.data))
+    except Exception as e:
+        print("Failed to fetch chat history:", e)
+
+    messages = [{"role": "system", "content": system_prompt}]
+    for h in history:
+        messages.append({"role": h["role"], "content": h["content"]})
+    messages.append({"role": "user", "content": text})
+
+    try:
+        supabase.table(history_table).insert({
+            user_column: user_id,
+            "role": "user",
+            "content": text
+        }).execute()
+    except Exception as e:
+        print("Failed to save user history:", e)
+
+    response = requests.post(
+        "https://ollama.com/api/chat",
+        json={
+            "model": "gpt-oss:120b",
+            "messages": messages,
+            "stream": False
+        },
+        headers={"Authorization": f"Bearer {OLLAMA_KEY}"},
+        timeout=120
+    )
+    
+    answer = response.json().get("message", {}).get("content", "Sorry, I couldn't generate an answer.")
+    
+    try:
+        supabase.table(history_table).insert({
+            user_column: user_id,
+            "role": "assistant",
+            "content": answer
+        }).execute()
+    except Exception as e:
+        print("Failed to save assistant history:", e)
+
+    return answer
+
 
 # --- Routes ---
 @app.post("/webhook")
@@ -311,131 +456,8 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
                 send_telegram(chat_id, "عذراً، حصل مشكلة في جلب قائمة الملفات.")
             return JSONResponse({"ok": True})
 
-        # Vector Search: find relevant chunks
-        similar_docs = search_similar(text, limit=12)
-
-        def get_source(d):
-            meta = d.get('metadata', {})
-            if isinstance(meta, str):
-                try:
-                    meta = json.loads(meta)
-                except:
-                    meta = {}
-            return meta.get('source', 'Unknown') if isinstance(meta, dict) else 'Unknown'
-
-        # Get list of available source files for the prompt
-        available_sources = set()
-        if similar_docs:
-            for d in similar_docs:
-                available_sources.add(get_source(d))
-            context = "\n\n".join([f"[{get_source(d)}]\n{d['content']}" for d in similar_docs])
-        else:
-            result = supabase.table("documents").select("content, metadata").limit(20).execute()
-            context = "\n\n".join([f"[{get_source(d)}]\n{d['content']}" for d in result.data])[:8000]
-            for d in result.data:
-                available_sources.add(get_source(d))
-
-        sources_list = ", ".join(sorted(available_sources)) if available_sources else "المنهج"
-
-        # Read OPUS System Prompt dynamically
-        opus_prompt_path = os.path.join(os.path.dirname(__file__), "OPUS_Universal_System_Prompt.md")
-        opus_content = ""
-        try:
-            with open(opus_prompt_path, "r", encoding="utf-8") as f:
-                raw_content = f.read()
-                if "```text" in raw_content:
-                    opus_content = raw_content.split("```text")[1].split("```")[0].strip()
-                else:
-                    opus_content = raw_content.strip()
-        except Exception as e:
-            print("Failed to read OPUS prompt:", e)
-            opus_content = "You are OPUS. Act as a professional assistant."
-
-        system_prompt = f"""{opus_content}
-
----
-
-## SPECIFIC PROJECT ROLE (MR MAGED'S ASSISTANT)
-
-YOUR IDENTITY:
-- You are ALSO acting as "مساعد مستر ماجد الذكي" (MR Maged's Smart AI Assistant) — a friendly, knowledgeable English tutor built specifically for MR Maged's students.
-- You cover ALL units and materials that MR Maged has uploaded.
-- Currently loaded materials: {sources_list}
-- You should know what content you have and tell students about all available units when asked.
-
-YOUR ROLE & PERSONA (ABSOLUTE PRIORITY):
-- TONE & LANGUAGE OVERRIDE: You MUST completely drop your standard formal language. You MUST speak EXCLUSIVELY in friendly Egyptian Arabic (عامية مصرية) mixed with English. Never use "الفصحى" (Modern Standard Arabic). Speak exactly like a relaxed, friendly Egyptian English teacher.
-- Examples of your tone: "بص يا بطل", "عشان تفهم دي صح ركز معايا", "الـ Present Simple ده بنستخدمه لما...".
-- You MUST ALWAYS act exactly like MR Maged. Adopt his unique teaching style, his tone, and his way of explaining things. Think and speak as if you are him. NEVER break character.
-- EXPLANATION STYLE: Give the "خلاصة" (the core concept simply and directly) without writing long textbook essays. Keep your explanations concise, directly to the point, and very easy to read.
-- Help students study English using MR Maged's course materials as your primary source.
-- Explain concepts step by step exactly as MR Maged would, using his exact words and teaching flow.
-- Answer any English-related question as a professional English teacher, but always through the lens of MR Maged's personality.
-
-SPECIFIC RESPONSE RULES:
-1. THE MR MAGED WAY: Your highest priority is to explain and behave like MR Maged. If you are about to give an explanation, format and deliver it exactly as MR Maged would in his classes (using Egyptian Arabic and simple terms).
-2. NO TABLES & NO FORMAL ARABIC: You MUST NEVER use Markdown tables. Always use simple bullet points. You MUST NEVER use formal Arabic words like (متى نستخدمه، يتم استعماله، أمثلة توضيحية). Replace them with Egyptian phrases like (بنستخدمه إمتى، أمثلة عشان تفهم).
-3. ENGLISH FREEDOM: You can answer ANY English-related question normally as a professional English teacher, even if the topic is OUTSIDE MR Maged's uploaded files.
-4. PREFERRED EXAMPLES: When providing examples to explain a concept, you MUST PREFER to use examples directly from MR Maged's uploaded files whenever possible.
-5. OUT OF SCOPE APOLOGY: If the user asks for ANYTHING outside the scope of learning English (e.g., coding, math, general chatting, politics), you MUST politely apologize in Egyptian Arabic ONLY. Example: "بعتذر جداً يا بطل، أنا مبرمج هنا عشان أساعدك في الإنجليزي وبس. أقدر أساعدك في إيه في المنهج؟"
-6. When giving vocabulary, include Arabic translation if MR Maged provided one.
-7. NEVER mention the source file name, unit name, or document name in your general responses or greetings unless the student specifically asks for it. When asked what units/topics you cover, list the available topics simply and briefly.
-8. MINIMIZE 'UNIT': Completely minimize the use of the word 'unit' (أو 'الوحدة'). Do NOT mention it unless the student explicitly asks about it.
-9. NO BOLDING OR STARS: You MUST NEVER use asterisks (**) or markdown bolding anywhere in your response. Do not bold English words, and do not bold Arabic words. Keep the text completely plain, clean, and natural.
-10. HUMAN CHAT (BITE-SIZED): You are chatting on a messaging app (Telegram), NOT writing a textbook. Keep your answers EXTREMELY short, simple, and conversational. NEVER give long lists. Give a maximum of 2 to 3 examples at a time. Give the student the bare minimum to understand easily, then ask a natural conversational question if they want to practice or learn more.
-
-COURSE MATERIALS FROM MR MAGED:
-{context}
-"""
-
-        # Fetch the last 40 messages for this user (Conversation Memory)
-        history = []
-        try:
-            history_response = supabase.table("chat_history").select("role, content").eq("chat_id", chat_id).order("created_at", desc=True).limit(40).execute()
-            history = list(reversed(history_response.data))
-        except Exception as e:
-            print("Failed to fetch chat history:", e)
-
-        # Build messages array
-        messages = [{"role": "system", "content": system_prompt}]
-        for h in history:
-            messages.append({"role": h["role"], "content": h["content"]})
-        messages.append({"role": "user", "content": text})
-
-        # Save current user message to DB
-        try:
-            supabase.table("chat_history").insert({
-                "chat_id": chat_id,
-                "role": "user",
-                "content": text
-            }).execute()
-        except Exception as e:
-            print("Failed to save user history:", e)
-
-        # Call Ollama
-        response = requests.post(
-            "https://ollama.com/api/chat",
-            json={
-                "model": "gpt-oss:120b",
-                "messages": messages,
-                "stream": False
-            },
-            headers={"Authorization": f"Bearer {OLLAMA_KEY}"},
-            timeout=120
-        )
-        
-        answer = response.json().get("message", {}).get("content", "Sorry, I couldn't generate an answer.")
-        
-        # Save assistant response to DB
-        try:
-            supabase.table("chat_history").insert({
-                "chat_id": chat_id,
-                "role": "assistant",
-                "content": answer
-            }).execute()
-        except Exception as e:
-            print("Failed to save assistant history:", e)
-
+        # Vector Search and Ollama
+        answer = get_rag_response(chat_id, text, "chat_history", "chat_id")
         send_telegram(chat_id, answer)
         return JSONResponse({"ok": True})
 
@@ -443,6 +465,57 @@ COURSE MATERIALS FROM MR MAGED:
         print(f"Webhook error: {e}")
         if chat_id:
             send_telegram(chat_id, f"عذراً، حصل خطأ تقني: {str(e)}")
+        return JSONResponse({"status": "error", "detail": str(e)})
+
+@app.get("/whatsapp-webhook")
+async def verify_whatsapp_webhook(request: Request):
+    """Webhook verification for Meta."""
+    mode = request.query_params.get("hub.mode")
+    token = request.query_params.get("hub.verify_token")
+    challenge = request.query_params.get("hub.challenge")
+
+    if mode and token:
+        if mode == "subscribe" and token == WHATSAPP_VERIFY_TOKEN:
+            return PlainTextResponse(content=challenge)
+    return JSONResponse({"status": "error"}, status_code=403)
+
+@app.post("/whatsapp-webhook")
+async def receive_whatsapp_webhook(request: Request):
+    try:
+        data = await request.json()
+        
+        if "object" in data and data["object"] == "whatsapp_business_account":
+            for entry in data.get("entry", []):
+                for change in entry.get("changes", []):
+                    value = change.get("value", {})
+                    
+                    if "messages" in value:
+                        messages = value["messages"]
+                        contacts = value.get("contacts", [])
+                        
+                        for msg in messages:
+                            if msg.get("type") != "text":
+                                continue
+                                
+                            phone = msg.get("from")
+                            text = msg.get("text", {}).get("body", "")
+                            
+                            contact_name = contacts[0].get("profile", {}).get("name", "User") if contacts else "User"
+
+                            try:
+                                supabase.table("whatsapp_users").upsert({
+                                    "phone_number": phone,
+                                    "name": contact_name
+                                }).execute()
+                            except Exception as e:
+                                print("Failed to save WA user:", e)
+
+                            answer = get_rag_response(phone, text, "whatsapp_chat_history", "phone_number")
+                            send_whatsapp(phone, answer)
+                            
+        return JSONResponse({"ok": True})
+    except Exception as e:
+        print(f"WA Webhook error: {e}")
         return JSONResponse({"status": "error", "detail": str(e)})
 
 
