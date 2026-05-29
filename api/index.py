@@ -249,10 +249,26 @@ http_session = _make_session()
 def send_telegram(chat_id, text):
     for i in range(0, len(text), 4000):
         try:
-            http_session.post(f"{TELEGRAM_API}/sendMessage",
+            r = http_session.post(f"{TELEGRAM_API}/sendMessage",
                 json={"chat_id": chat_id, "text": text[i:i+4000]}, timeout=60)
+            if r.status_code != 200:
+                print(f"[TG SEND ERROR] {r.status_code}: {r.text}")
+                try:
+                    supabase.table("chat_history").insert({
+                        "chat_id": chat_id,
+                        "role": "assistant",
+                        "content": f"[DEBUG TG ERROR] {r.status_code}: {r.text}"
+                    }).execute()
+                except: pass
         except Exception as e:
             print(f"[TG SEND FAIL] {e}")
+            try:
+                supabase.table("chat_history").insert({
+                    "chat_id": chat_id,
+                    "role": "assistant",
+                    "content": f"[DEBUG TG EXCEPTION] {e}"
+                }).execute()
+            except: pass
 
 def send_telegram_typing(chat_id):
     try:
@@ -263,11 +279,20 @@ def send_telegram_typing(chat_id):
 
 def send_telegram_keyboard(chat_id, text, keyboard):
     try:
-        http_session.post(f"{TELEGRAM_API}/sendMessage",
+        r = http_session.post(f"{TELEGRAM_API}/sendMessage",
             json={"chat_id": chat_id, "text": text, "reply_markup": keyboard}, 
             timeout=60)
+        if r.status_code != 200:
+            print(f"[TG KEYBOARD ERROR] {r.status_code}: {r.text}")
+            try:
+                supabase.table("chat_history").insert({
+                    "chat_id": chat_id,
+                    "role": "assistant",
+                    "content": f"[DEBUG TG KBD ERROR] {r.status_code}: {r.text}"
+                }).execute()
+            except: pass
     except Exception as e:
-        print(f"[TG KB FAIL] {e}")
+        print(f"[TG KEYBOARD FAIL] {e}")
 
 def mark_whatsapp_read(message_id):
     if not WHATSAPP_PHONE_ID or not WHATSAPP_TOKEN:
