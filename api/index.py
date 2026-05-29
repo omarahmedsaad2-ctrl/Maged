@@ -24,6 +24,13 @@ load_dotenv()
 
 app = FastAPI()
 
+import anyio
+@app.on_event("startup")
+async def startup_event():
+    # Increase thread pool to 500 to handle massive concurrent requests without hanging
+    limiter = anyio.to_thread.current_default_thread_limiter()
+    limiter.total_tokens = 500
+
 # --- Config ---
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 WHATSAPP_TOKEN = os.getenv("WHATSAPP_TOKEN")
