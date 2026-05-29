@@ -41,7 +41,26 @@ async def startup_event():
         verify=False,
         transport=transport,
     )
-    print("===== Async HTTP client ready (SSL bypass + 3 retries) =====", flush=True)
+    # Start WhatsApp queue worker (processes messages sequentially)
+    asyncio.create_task(_wa_queue_worker())
+    print("===== Async HTTP client + WA queue worker ready =====", flush=True)
+
+
+# --- WhatsApp Queue (sequential processing like Telegram inline) ---
+_wa_queue = asyncio.Queue()
+
+
+async def _wa_queue_worker():
+    """Process WhatsApp messages one at a time from the queue."""
+    print("[WA Worker] Started, waiting for messages...", flush=True)
+    while True:
+        try:
+            data = await _wa_queue.get()
+            await process_whatsapp_message(data)
+        except Exception as e:
+            print(f"[WA Worker] Error: {e}", flush=True)
+        finally:
+            _wa_queue.task_done()
 
 
 @app.on_event("shutdown")
@@ -277,25 +296,24 @@ async def send_telegram_keyboard(chat_id, text, keyboard):
 
 
 async def mark_whatsapp_read(message_id):
+    """Mark message as read (blue ticks). Uses fresh connection."""
     if not WHATSAPP_PHONE_ID or not WHATSAPP_TOKEN:
         return
     try:
         url = f"https://graph.facebook.com/v25.0/{WHATSAPP_PHONE_ID}/messages"
         headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
-        await asyncio.wait_for(
-            _client.post(url, headers=headers, json={
+        async with httpx.AsyncClient(timeout=5, verify=False) as c:
+            await c.post(url, headers=headers, json={
                 "messaging_product": "whatsapp",
                 "status": "read",
                 "message_id": message_id
-            }), timeout=5
-        )
-    except asyncio.TimeoutError:
-        print(f"[WA READ TIMEOUT] 5s for msg {message_id}", flush=True)
-    except:
-        pass
+            })
+    except Exception:
+        pass  # Blue ticks are non-critical
 
 
 async def send_whatsapp(to_phone, text):
+    """Send WhatsApp message using a fresh connection per attempt (avoids HF stale pool)."""
     if not WHATSAPP_PHONE_ID or not WHATSAPP_TOKEN:
         print("WhatsApp credentials missing.", flush=True)
         return
@@ -310,21 +328,16 @@ async def send_whatsapp(to_phone, text):
             "messaging_product": "whatsapp",
             "to": to_phone,
             "type": "text",
-            "text": {
-                "body": chunk
-            }
+            "text": {"body": chunk}
         }
         for attempt in range(3):
             try:
-                r = await asyncio.wait_for(
-                    _client.post(url, headers=headers, json=data), timeout=30
-                )
+                async with httpx.AsyncClient(timeout=30, verify=False) as c:
+                    r = await c.post(url, headers=headers, json=data)
                 if r.status_code == 200:
                     print(f"[WA SEND] OK to {to_phone}", flush=True)
                     break
-                print(f"[WA SEND ERROR] attempt {attempt+1}: {r.status_code}: {r.text}", flush=True)
-            except asyncio.TimeoutError:
-                print(f"[WA SEND TIMEOUT] attempt {attempt+1}: 30s timeout for {to_phone}", flush=True)
+                print(f"[WA SEND ERROR] attempt {attempt+1}: {r.status_code}: {r.text[:200]}", flush=True)
             except Exception as e:
                 print(f"[WA SEND FAIL] attempt {attempt+1}: {type(e).__name__}: {repr(e)}", flush=True)
             if attempt < 2:
@@ -837,11 +850,12 @@ async def verify_whatsapp_webhook(request: Request):
 async def receive_whatsapp_webhook(request: Request):
     try:
         data = await request.json()
-        asyncio.create_task(process_whatsapp_message(data))
+        # Add to queue for sequential processing (stable, no race conditions)
+        await _wa_queue.put(data)
         return JSONResponse({"ok": True})
     except Exception as e:
         print(f"WA Webhook error: {e}", flush=True)
-        return JSONResponse({"status": "error", "detail": str(e)})
+        return JSONResponse({"ok": True})
 
 
 @app.get("/sync-now")
