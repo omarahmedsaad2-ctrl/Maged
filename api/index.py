@@ -33,12 +33,15 @@ _client: httpx.AsyncClient = None
 @app.on_event("startup")
 async def startup_event():
     global _client
+    transport = httpx.AsyncHTTPTransport(retries=3)
     _client = httpx.AsyncClient(
-        timeout=httpx.Timeout(120.0, connect=10.0),
+        timeout=httpx.Timeout(120.0, connect=15.0),
         limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
         follow_redirects=True,
+        verify=False,
+        transport=transport,
     )
-    print("===== Async HTTP client ready =====", flush=True)
+    print("===== Async HTTP client ready (SSL bypass + 3 retries) =====", flush=True)
 
 
 @app.on_event("shutdown")
@@ -221,16 +224,21 @@ async def run_sync_logic(chat_id=None):
     return f"Synced {len(files_to_sync)} files ({total_chunks} chunks)."
 
 
-# --- Send Functions (all async) ---
+# --- Send Functions (all async with retry) ---
 async def send_telegram(chat_id, text):
     for i in range(0, len(str(text)), 4000):
-        try:
-            r = await _client.post(f"{TELEGRAM_API}/sendMessage",
-                json={"chat_id": chat_id, "text": str(text)[i:i+4000]})
-            if r.status_code != 200:
-                print(f"[TG SEND ERROR] {r.status_code}: {r.text}", flush=True)
-        except Exception as e:
-            print(f"[TG SEND FAIL] {e}", flush=True)
+        chunk = str(text)[i:i+4000]
+        for attempt in range(3):
+            try:
+                r = await _client.post(f"{TELEGRAM_API}/sendMessage",
+                    json={"chat_id": chat_id, "text": chunk})
+                if r.status_code == 200:
+                    break
+                print(f"[TG SEND ERROR] attempt {attempt+1}: {r.status_code}: {r.text}", flush=True)
+            except Exception as e:
+                print(f"[TG SEND FAIL] attempt {attempt+1}: {type(e).__name__}: {repr(e)}", flush=True)
+                if attempt < 2:
+                    await asyncio.sleep(1)
 
 
 async def send_telegram_typing(chat_id):
@@ -276,19 +284,26 @@ async def send_whatsapp(to_phone, text):
         "Content-Type": "application/json"
     }
     for i in range(0, len(str(text)), 4000):
+        chunk = str(text)[i:i+4000]
         data = {
             "messaging_product": "whatsapp",
             "to": to_phone,
             "type": "text",
             "text": {
-                "body": str(text)[i:i+4000]
+                "body": chunk
             }
         }
-        try:
-            r = await _client.post(url, headers=headers, json=data)
-            print(f"[WA SEND] Status: {r.status_code}", flush=True)
-        except Exception as e:
-            print(f"[WA SEND FAIL] {e}", flush=True)
+        for attempt in range(3):
+            try:
+                r = await _client.post(url, headers=headers, json=data)
+                if r.status_code == 200:
+                    print(f"[WA SEND] OK to {to_phone}", flush=True)
+                    break
+                print(f"[WA SEND ERROR] attempt {attempt+1}: {r.status_code}: {r.text}", flush=True)
+            except Exception as e:
+                print(f"[WA SEND FAIL] attempt {attempt+1}: {type(e).__name__}: {repr(e)}", flush=True)
+                if attempt < 2:
+                    await asyncio.sleep(1)
 
 
 # --- RAG Response ---
