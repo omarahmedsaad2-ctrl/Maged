@@ -409,8 +409,16 @@ COURSE MATERIALS FROM MR MAGED:
         headers={"Authorization": f"Bearer {OLLAMA_KEY}"},
         timeout=120
     )
-    
+    import re
     answer = response.json().get("message", {}).get("content", "Sorry, I couldn't generate an answer.")
+    
+    # Strip thinking/reasoning tags that some models output
+    answer = re.sub(r'<thinking>.*?</thinking>', '', answer, flags=re.DOTALL).strip()
+    answer = re.sub(r'<thought>.*?</thought>', '', answer, flags=re.DOTALL).strip()
+    answer = re.sub(r'<reasoning>.*?</reasoning>', '', answer, flags=re.DOTALL).strip()
+    
+    if not answer:
+        answer = "عذراً، لم أتمكن من إنشاء إجابة. حاول مرة أخرى."
     
     try:
         supabase.table(history_table).insert({
