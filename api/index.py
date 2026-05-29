@@ -205,22 +205,48 @@ def ask_ollama(system_prompt, user_message):
     return response.json().get("message", {}).get("content", "Sorry, I couldn't process that.")
 
 
+# --- Robust HTTP Session with retries for HF Spaces ---
+from requests.adapters import HTTPAdapter
+from urllib3.util.retry import Retry
+
+def _make_session():
+    s = requests.Session()
+    retries = Retry(
+        total=3,
+        backoff_factor=1,
+        status_forcelist=[500, 502, 503, 504],
+        allowed_methods=["POST", "GET"],
+    )
+    adapter = HTTPAdapter(max_retries=retries)
+    s.mount("https://", adapter)
+    s.mount("http://", adapter)
+    return s
+
+http_session = _make_session()
+
+
 def send_telegram(chat_id, text):
     for i in range(0, len(text), 4000):
-        requests.post(f"{TELEGRAM_API}/sendMessage",
-            json={"chat_id": chat_id, "text": text[i:i+4000]}, timeout=30)
+        try:
+            http_session.post(f"{TELEGRAM_API}/sendMessage",
+                json={"chat_id": chat_id, "text": text[i:i+4000]}, timeout=60)
+        except Exception as e:
+            print(f"[TG SEND FAIL] {e}")
 
 def send_telegram_typing(chat_id):
     try:
-        requests.post(f"{TELEGRAM_API}/sendChatAction",
-            json={"chat_id": chat_id, "action": "typing"}, timeout=10)
+        http_session.post(f"{TELEGRAM_API}/sendChatAction",
+            json={"chat_id": chat_id, "action": "typing"}, timeout=15)
     except:
         pass
 
 def send_telegram_keyboard(chat_id, text, keyboard):
-    requests.post(f"{TELEGRAM_API}/sendMessage",
-        json={"chat_id": chat_id, "text": text, "reply_markup": keyboard}, 
-        timeout=30)
+    try:
+        http_session.post(f"{TELEGRAM_API}/sendMessage",
+            json={"chat_id": chat_id, "text": text, "reply_markup": keyboard}, 
+            timeout=60)
+    except Exception as e:
+        print(f"[TG KB FAIL] {e}")
 
 def mark_whatsapp_read(message_id):
     if not WHATSAPP_PHONE_ID or not WHATSAPP_TOKEN:
@@ -228,11 +254,11 @@ def mark_whatsapp_read(message_id):
     try:
         url = f"https://graph.facebook.com/v25.0/{WHATSAPP_PHONE_ID}/messages"
         headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
-        requests.post(url, headers=headers, json={
+        http_session.post(url, headers=headers, json={
             "messaging_product": "whatsapp",
             "status": "read",
             "message_id": message_id
-        }, timeout=10)
+        }, timeout=15)
     except:
         pass
 
@@ -255,7 +281,7 @@ def send_whatsapp(to_phone, text):
             }
         }
         try:
-            r = requests.post(url, headers=headers, json=data, timeout=30)
+            r = http_session.post(url, headers=headers, json=data, timeout=60)
             print(f"[WA SEND] Status: {r.status_code} | Response: {r.text}")
         except Exception as e:
             print(f"Failed to send WA message: {e}")
@@ -373,7 +399,7 @@ COURSE MATERIALS FROM MR MAGED:
     except Exception as e:
         print("Failed to save user history:", e)
 
-    response = requests.post(
+    response = http_session.post(
         "https://ollama.com/api/chat",
         json={
             "model": "gpt-oss:120b",
@@ -589,7 +615,7 @@ async def sync_now():
 @app.get("/set-webhook")
 async def set_webhook(request: Request):
     base_url = str(request.base_url).rstrip("/")
-    r = requests.get(f"{TELEGRAM_API}/setWebhook?url={base_url}/webhook")
+    r = http_session.get(f"{TELEGRAM_API}/setWebhook?url={base_url}/webhook", timeout=60)
     return r.json()
 
 
