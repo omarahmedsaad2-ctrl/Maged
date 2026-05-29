@@ -224,39 +224,56 @@ async def run_sync_logic(chat_id=None):
     return f"Synced {len(files_to_sync)} files ({total_chunks} chunks)."
 
 
-# --- Send Functions (all async with retry) ---
+# --- Send Functions (all async with retry + hard timeouts) ---
+async def _tg_post(url, json_data, timeout=30):
+    """POST to Telegram API with a hard asyncio timeout."""
+    return await asyncio.wait_for(_client.post(url, json=json_data), timeout=timeout)
+
+
 async def send_telegram(chat_id, text):
     for i in range(0, len(str(text)), 4000):
         chunk = str(text)[i:i+4000]
         for attempt in range(3):
             try:
-                r = await _client.post(f"{TELEGRAM_API}/sendMessage",
-                    json={"chat_id": chat_id, "text": chunk})
+                r = await _tg_post(f"{TELEGRAM_API}/sendMessage",
+                    {"chat_id": chat_id, "text": chunk}, timeout=30)
                 if r.status_code == 200:
+                    print(f"[TG SEND OK] to {chat_id}", flush=True)
                     break
                 print(f"[TG SEND ERROR] attempt {attempt+1}: {r.status_code}: {r.text}", flush=True)
+            except asyncio.TimeoutError:
+                print(f"[TG SEND TIMEOUT] attempt {attempt+1}: hard 30s timeout for {chat_id}", flush=True)
             except Exception as e:
                 print(f"[TG SEND FAIL] attempt {attempt+1}: {type(e).__name__}: {repr(e)}", flush=True)
-                if attempt < 2:
-                    await asyncio.sleep(1)
+            if attempt < 2:
+                await asyncio.sleep(1)
 
 
 async def send_telegram_typing(chat_id):
     try:
-        await _client.post(f"{TELEGRAM_API}/sendChatAction",
-            json={"chat_id": chat_id, "action": "typing"})
-    except:
-        pass
+        await _tg_post(f"{TELEGRAM_API}/sendChatAction",
+            {"chat_id": chat_id, "action": "typing"}, timeout=5)
+        print(f"[TG TYPING OK] {chat_id}", flush=True)
+    except asyncio.TimeoutError:
+        print(f"[TG TYPING TIMEOUT] 5s hard timeout for {chat_id}", flush=True)
+    except Exception as e:
+        print(f"[TG TYPING FAIL] {type(e).__name__}: {repr(e)}", flush=True)
 
 
 async def send_telegram_keyboard(chat_id, text, keyboard):
-    try:
-        r = await _client.post(f"{TELEGRAM_API}/sendMessage",
-            json={"chat_id": chat_id, "text": text, "reply_markup": keyboard})
-        if r.status_code != 200:
-            print(f"[TG KEYBOARD ERROR] {r.status_code}: {r.text}", flush=True)
-    except Exception as e:
-        print(f"[TG KEYBOARD FAIL] {e}", flush=True)
+    for attempt in range(3):
+        try:
+            r = await _tg_post(f"{TELEGRAM_API}/sendMessage",
+                {"chat_id": chat_id, "text": text, "reply_markup": keyboard}, timeout=30)
+            if r.status_code == 200:
+                break
+            print(f"[TG KEYBOARD ERROR] attempt {attempt+1}: {r.status_code}: {r.text}", flush=True)
+        except asyncio.TimeoutError:
+            print(f"[TG KEYBOARD TIMEOUT] attempt {attempt+1}: 30s timeout for {chat_id}", flush=True)
+        except Exception as e:
+            print(f"[TG KEYBOARD FAIL] attempt {attempt+1}: {type(e).__name__}: {repr(e)}", flush=True)
+        if attempt < 2:
+            await asyncio.sleep(1)
 
 
 async def mark_whatsapp_read(message_id):
