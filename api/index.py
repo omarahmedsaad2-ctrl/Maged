@@ -31,7 +31,10 @@ WHATSAPP_PHONE_ID = os.getenv("WHATSAPP_PHONE_ID")
 WHATSAPP_VERIFY_TOKEN = os.getenv("WHATSAPP_VERIFY_TOKEN", "maged_bot_secure_token")
 SUPABASE_URL = os.getenv("SUPABASE_URL")
 SUPABASE_KEY = os.getenv("SUPABASE_SERVICE_KEY")
-OLLAMA_KEY = os.getenv("OLLAMA_API_KEY", "").strip().replace('\ufeff', '').replace('\r', '').replace('\n', '')
+OLLAMA_KEYS_RAW = os.getenv("OLLAMA_API_KEYS", os.getenv("OLLAMA_API_KEY", ""))
+OLLAMA_KEYS = [k.strip().replace('\ufeff', '').replace('\r', '').replace('\n', '') for k in OLLAMA_KEYS_RAW.split(",") if k.strip()]
+current_ollama_key_index = 0
+
 GEMINI_KEYS_RAW = os.getenv("GEMINI_API_KEYS", "")
 GEMINI_KEYS = [k.strip() for k in GEMINI_KEYS_RAW.split(",") if k.strip()]
 current_gemini_key_index = 0
@@ -190,20 +193,37 @@ def run_sync_logic(chat_id=None):
 
 # --- Bot Logic ---
 def ask_ollama(system_prompt, user_message):
-    response = requests.post(
-        "https://ollama.com/api/chat",
-        headers={"Authorization": f"Bearer {OLLAMA_KEY}", "Content-Type": "application/json"},
-        json={
-            "model": "gpt-oss:120b",
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_message}
-            ],
-            "stream": False
-        },
-        timeout=120
-    )
-    return response.json().get("message", {}).get("content", "Sorry, I couldn't process that.")
+    global current_ollama_key_index
+    if not OLLAMA_KEYS:
+        return "Sorry, no Ollama API keys configured."
+    
+    for attempt in range(len(OLLAMA_KEYS)):
+        current_key = OLLAMA_KEYS[current_ollama_key_index]
+        try:
+            response = requests.post(
+                "https://ollama.com/api/chat",
+                headers={"Authorization": f"Bearer {current_key}", "Content-Type": "application/json"},
+                json={
+                    "model": "gpt-oss:120b",
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": user_message}
+                    ],
+                    "stream": False
+                },
+                timeout=120
+            )
+            if response.status_code == 200:
+                return response.json().get("message", {}).get("content", "Sorry, I couldn't process that.")
+            elif response.status_code in [401, 403, 429, 500, 502, 503, 504]:
+                print(f"Ollama key {current_ollama_key_index} failed ({response.status_code}), switching...")
+                current_ollama_key_index = (current_ollama_key_index + 1) % len(OLLAMA_KEYS)
+                continue
+        except Exception as e:
+            print(f"Ollama key {current_ollama_key_index} exception: {e}, switching...")
+            current_ollama_key_index = (current_ollama_key_index + 1) % len(OLLAMA_KEYS)
+            continue
+    return "Sorry, I couldn't process that."
 
 
 # --- Robust HTTP Session with retries for HF Spaces ---
@@ -284,8 +304,25 @@ def send_whatsapp(to_phone, text):
         try:
             r = http_session.post(url, headers=headers, json=data, timeout=60)
             print(f"[WA SEND] Status: {r.status_code} | Response: {r.text}")
+            if r.status_code != 200:
+                try:
+                    supabase.table("whatsapp_chat_history").insert({
+                        "phone_number": to_phone,
+                        "role": "assistant",
+                        "content": f"[DEBUG WA ERROR]: {r.status_code} - {r.text}"
+                    }).execute()
+                except Exception as db_err:
+                    print("Debug DB fail:", db_err)
         except Exception as e:
             print(f"Failed to send WA message: {e}")
+            try:
+                supabase.table("whatsapp_chat_history").insert({
+                    "phone_number": to_phone,
+                    "role": "assistant",
+                    "content": f"[DEBUG WA EXCEPTION]: {str(e)}"
+                }).execute()
+            except:
+                pass
 
 GREETINGS = {"hi", "hello", "hey", "هلا", "اهلا", "مرحبا", "هاي", "السلام عليكم", "ازيك", "ازيكم", "صباح الخير", "مساء الخير", "يا مستر", "مستر"}
 
@@ -417,18 +454,35 @@ COURSE MATERIALS:
     except Exception as e:
         print("Failed to save user history:", e)
 
-    response = http_session.post(
-        "https://ollama.com/api/chat",
-        json={
-            "model": "gpt-oss:120b",
-            "messages": messages,
-            "stream": False
-        },
-        headers={"Authorization": f"Bearer {OLLAMA_KEY}"},
-        timeout=120
-    )
-    import re
-    answer = response.json().get("message", {}).get("content", "Sorry, I couldn't generate an answer.")
+    global current_ollama_key_index
+    answer = "Sorry, I couldn't generate an answer."
+    
+    for attempt in range(max(1, len(OLLAMA_KEYS))):
+        current_key = OLLAMA_KEYS[current_ollama_key_index] if OLLAMA_KEYS else ""
+        try:
+            response = http_session.post(
+                "https://ollama.com/api/chat",
+                json={
+                    "model": "gpt-oss:120b",
+                    "messages": messages,
+                    "stream": False
+                },
+                headers={"Authorization": f"Bearer {current_key}"},
+                timeout=120
+            )
+            if response.status_code == 200:
+                answer = response.json().get("message", {}).get("content", "Sorry, I couldn't generate an answer.")
+                break
+            else:
+                print(f"Ollama key {current_ollama_key_index} returned {response.status_code}, switching...")
+                if OLLAMA_KEYS:
+                    current_ollama_key_index = (current_ollama_key_index + 1) % len(OLLAMA_KEYS)
+                continue
+        except Exception as e:
+            print(f"Ollama key {current_ollama_key_index} threw {e}, switching...")
+            if OLLAMA_KEYS:
+                current_ollama_key_index = (current_ollama_key_index + 1) % len(OLLAMA_KEYS)
+            continue
     
     # 1. Remove block tags + their content (model internal reasoning)
     block_tags = r'<(?:thinking|thought|reasoning|reflect|internal|scratchpad|meta|plan|analysis|step_by_step|chain_of_thought|inner_monologue)>.*?</(?:thinking|thought|reasoning|reflect|internal|scratchpad|meta|plan|analysis|step_by_step|chain_of_thought|inner_monologue)>'
@@ -584,6 +638,18 @@ def process_whatsapp_message(data):
                 for change in entry.get("changes", []):
                     value = change.get("value", {})
                     
+                    if "statuses" in value:
+                        for status in value["statuses"]:
+                            if status.get("status") == "failed":
+                                try:
+                                    supabase.table("whatsapp_chat_history").insert({
+                                        "phone_number": status.get("recipient_id", "unknown"),
+                                        "role": "assistant",
+                                        "content": f"[DEBUG STATUS FAILED]: {status}"
+                                    }).execute()
+                                except:
+                                    pass
+
                     if "messages" in value:
                         messages = value["messages"]
                         contacts = value.get("contacts", [])
