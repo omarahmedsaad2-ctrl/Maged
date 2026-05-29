@@ -1,0 +1,72 @@
+name: AI Bot Server
+
+on:
+  workflow_dispatch:
+  schedule:
+    # Auto-restart every 5 hours 50 minutes
+    - cron: '50 */6 * * *'
+
+jobs:
+  run-bot:
+    runs-on: ubuntu-latest
+    timeout-minutes: 360  # 6 hours max
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Install cloudflared
+        run: |
+          curl -L https://github.com/cloudflare/cloudflared/releases/latest/download/cloudflared-linux-amd64 -o cloudflared
+          chmod +x cloudflared
+
+      - name: Start bot server
+        env:
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          SUPABASE_URL: ${{ secrets.SUPABASE_URL }}
+          SUPABASE_SERVICE_KEY: ${{ secrets.SUPABASE_SERVICE_KEY }}
+          OLLAMA_API_KEY: ${{ secrets.OLLAMA_API_KEY }}
+          GOOGLE_CLIENT_ID: ${{ secrets.GOOGLE_CLIENT_ID }}
+          GOOGLE_CLIENT_SECRET: ${{ secrets.GOOGLE_CLIENT_SECRET }}
+          GEMINI_API_KEYS: ${{ secrets.GEMINI_API_KEYS }}
+          GOOGLE_SERVICE_ACCOUNT_JSON: ${{ secrets.GOOGLE_SERVICE_ACCOUNT_JSON }}
+          WHATSAPP_TOKEN: ${{ secrets.WHATSAPP_TOKEN }}
+          WHATSAPP_PHONE_ID: ${{ secrets.WHATSAPP_PHONE_ID }}
+          WHATSAPP_VERIFY_TOKEN: ${{ secrets.WHATSAPP_VERIFY_TOKEN }}
+        run: |
+          # Start uvicorn in background
+          python -m uvicorn api.index:app --host 0.0.0.0 --port 8000 &
+          sleep 5
+
+          # Start cloudflared tunnel and capture URL
+          ./cloudflared tunnel --url http://localhost:8000 --logfile cloudflared.log &
+          sleep 10
+
+          # Extract the tunnel URL from logs
+          TUNNEL_URL=$(grep -oP 'https://[a-zA-Z0-9-]+\.trycloudflare\.com' cloudflared.log | head -1)
+          echo "Tunnel URL: $TUNNEL_URL"
+
+          # Set Telegram webhook
+          curl -s "$TUNNEL_URL/set-webhook"
+          echo ""
+          echo "Telegram webhook set!"
+
+          # Print WhatsApp webhook URL for manual setup
+          echo "========================================"
+          echo "WhatsApp Webhook URL: $TUNNEL_URL/whatsapp-webhook"
+          echo "Verify Token: maged_bot_secure_token"
+          echo "========================================"
+
+          # Keep alive for ~5 hours 50 minutes then auto-restart
+          echo "Bot is running! Will auto-restart in ~5h50m..."
+          sleep 21000
+
+          echo "Time's up! The scheduled cron will restart the bot."

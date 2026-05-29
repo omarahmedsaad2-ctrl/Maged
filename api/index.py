@@ -210,10 +210,31 @@ def send_telegram(chat_id, text):
         requests.post(f"{TELEGRAM_API}/sendMessage",
             json={"chat_id": chat_id, "text": text[i:i+4000]}, timeout=30)
 
+def send_telegram_typing(chat_id):
+    try:
+        requests.post(f"{TELEGRAM_API}/sendChatAction",
+            json={"chat_id": chat_id, "action": "typing"}, timeout=10)
+    except:
+        pass
+
 def send_telegram_keyboard(chat_id, text, keyboard):
     requests.post(f"{TELEGRAM_API}/sendMessage",
         json={"chat_id": chat_id, "text": text, "reply_markup": keyboard}, 
         timeout=30)
+
+def mark_whatsapp_read(message_id):
+    if not WHATSAPP_PHONE_ID or not WHATSAPP_TOKEN:
+        return
+    try:
+        url = f"https://graph.facebook.com/v25.0/{WHATSAPP_PHONE_ID}/messages"
+        headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
+        requests.post(url, headers=headers, json={
+            "messaging_product": "whatsapp",
+            "status": "read",
+            "message_id": message_id
+        }, timeout=10)
+    except:
+        pass
 
 def send_whatsapp(to_phone, text):
     if not WHATSAPP_PHONE_ID or not WHATSAPP_TOKEN:
@@ -234,7 +255,8 @@ def send_whatsapp(to_phone, text):
             }
         }
         try:
-            requests.post(url, headers=headers, json=data, timeout=30)
+            r = requests.post(url, headers=headers, json=data, timeout=30)
+            print(f"[WA SEND] Status: {r.status_code} | Response: {r.text}")
         except Exception as e:
             print(f"Failed to send WA message: {e}")
 
@@ -456,7 +478,8 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
                 send_telegram(chat_id, "عذراً، حصل مشكلة في جلب قائمة الملفات.")
             return JSONResponse({"ok": True})
 
-        # Vector Search and Ollama
+        # Send typing indicator then process
+        send_telegram_typing(chat_id)
         answer = get_rag_response(chat_id, text, "chat_history", "chat_id")
         send_telegram(chat_id, answer)
         return JSONResponse({"ok": True})
@@ -499,19 +522,26 @@ async def receive_whatsapp_webhook(request: Request):
                                 
                             phone = msg.get("from")
                             text = msg.get("text", {}).get("body", "")
+                            msg_id = msg.get("id")
                             
                             contact_name = contacts[0].get("profile", {}).get("name", "User") if contacts else "User"
 
+                            # Mark as read (blue ticks) immediately
+                            mark_whatsapp_read(msg_id)
+
                             try:
-                                supabase.table("whatsapp_users").upsert({
-                                    "phone_number": phone,
-                                    "name": contact_name
-                                }).execute()
+                                supabase.table("whatsapp_users").upsert(
+                                    {"phone_number": phone, "name": contact_name},
+                                    on_conflict="phone_number"
+                                ).execute()
                             except Exception as e:
                                 print("Failed to save WA user:", e)
 
+                            print(f"[WA] Processing message from {phone}: {text[:50]}")
                             answer = get_rag_response(phone, text, "whatsapp_chat_history", "phone_number")
+                            print(f"[WA] Got answer, sending to {phone}...")
                             send_whatsapp(phone, answer)
+                            print(f"[WA] send_whatsapp completed for {phone}")
                             
         return JSONResponse({"ok": True})
     except Exception as e:
