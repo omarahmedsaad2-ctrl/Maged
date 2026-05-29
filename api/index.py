@@ -282,11 +282,15 @@ async def mark_whatsapp_read(message_id):
     try:
         url = f"https://graph.facebook.com/v25.0/{WHATSAPP_PHONE_ID}/messages"
         headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
-        await _client.post(url, headers=headers, json={
-            "messaging_product": "whatsapp",
-            "status": "read",
-            "message_id": message_id
-        })
+        await asyncio.wait_for(
+            _client.post(url, headers=headers, json={
+                "messaging_product": "whatsapp",
+                "status": "read",
+                "message_id": message_id
+            }), timeout=5
+        )
+    except asyncio.TimeoutError:
+        print(f"[WA READ TIMEOUT] 5s for msg {message_id}", flush=True)
     except:
         pass
 
@@ -312,15 +316,19 @@ async def send_whatsapp(to_phone, text):
         }
         for attempt in range(3):
             try:
-                r = await _client.post(url, headers=headers, json=data)
+                r = await asyncio.wait_for(
+                    _client.post(url, headers=headers, json=data), timeout=30
+                )
                 if r.status_code == 200:
                     print(f"[WA SEND] OK to {to_phone}", flush=True)
                     break
                 print(f"[WA SEND ERROR] attempt {attempt+1}: {r.status_code}: {r.text}", flush=True)
+            except asyncio.TimeoutError:
+                print(f"[WA SEND TIMEOUT] attempt {attempt+1}: 30s timeout for {to_phone}", flush=True)
             except Exception as e:
                 print(f"[WA SEND FAIL] attempt {attempt+1}: {type(e).__name__}: {repr(e)}", flush=True)
-                if attempt < 2:
-                    await asyncio.sleep(1)
+            if attempt < 2:
+                await asyncio.sleep(2)
 
 
 # --- RAG Response ---
