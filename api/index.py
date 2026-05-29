@@ -1,17 +1,18 @@
 """
-Telegram RAG Bot - Ollama Cloud + Vector Search.
-Uses Hugging Face Inference API (free) for embeddings.
-Uses Supabase pgvector for similarity search.
-Uses Ollama Cloud for chat responses.
+Telegram & WhatsApp RAG Bot - Ollama Cloud + Vector Search.
+Fully async architecture using httpx.AsyncClient for reliable
+outbound HTTP on Hugging Face Spaces.
 """
 import os
 import io
+import re
 import json
 import time
 import sys
-import requests
+import asyncio
 import httpx
-from fastapi import FastAPI, Request, BackgroundTasks
+import requests  # kept only for supabase internal use
+from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 from supabase import create_client, Client
 from pypdf import PdfReader
@@ -25,12 +26,27 @@ load_dotenv()
 
 app = FastAPI()
 
-import anyio
+# --- Global async HTTP client (created at startup) ---
+_client: httpx.AsyncClient = None
+
+
 @app.on_event("startup")
 async def startup_event():
-    # Increase thread pool to 500 to handle massive concurrent requests without hanging
-    limiter = anyio.to_thread.current_default_thread_limiter()
-    limiter.total_tokens = 500
+    global _client
+    _client = httpx.AsyncClient(
+        timeout=httpx.Timeout(120.0, connect=10.0),
+        limits=httpx.Limits(max_connections=100, max_keepalive_connections=20),
+        follow_redirects=True,
+    )
+    print("===== Async HTTP client ready =====", flush=True)
+
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    global _client
+    if _client:
+        await _client.aclose()
+
 
 # --- Config ---
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
@@ -52,55 +68,62 @@ ADMIN_CHAT_IDS = [8284113566, 5103350500]
 TELEGRAM_API = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}"
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
+
+# --- Helper: run sync supabase/drive calls in thread ---
+async def db(fn):
+    """Run a synchronous callable in a thread to avoid blocking the event loop."""
+    return await asyncio.to_thread(fn)
+
+
 # --- Embedding via Gemini API ---
-def get_embedding(text):
+async def get_embedding(text):
     """Get 768-dim embedding using Gemini API with failover."""
     global current_gemini_key_index
     if not GEMINI_KEYS:
         raise ValueError("No Gemini API keys found in .env (GEMINI_API_KEYS)")
-        
+
     for attempt in range(len(GEMINI_KEYS)):
         current_key = GEMINI_KEYS[current_gemini_key_index]
         url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-2:embedContent?key={current_key}"
-        
+
         try:
-            resp = httpx.post(url, json={
+            resp = await _client.post(url, json={
                 "model": "models/gemini-embedding-2",
                 "content": {
                     "parts": [{"text": text}]
                 },
                 "outputDimensionality": 768
-            }, timeout=30)
-            
+            })
+
             if resp.status_code == 200:
                 data = resp.json()
                 return data["embedding"]["values"]
             else:
-                print(f"Key {current_gemini_key_index} failed with {resp.status_code}: {resp.text}")
-                # Switch to next key
+                print(f"Gemini key {current_gemini_key_index} failed with {resp.status_code}: {resp.text}", flush=True)
                 current_gemini_key_index = (current_gemini_key_index + 1) % len(GEMINI_KEYS)
         except Exception as e:
-            print(f"Key {current_gemini_key_index} network error: {e}")
+            print(f"Gemini key {current_gemini_key_index} network error: {e}", flush=True)
             current_gemini_key_index = (current_gemini_key_index + 1) % len(GEMINI_KEYS)
-            
+
     raise Exception("All Gemini API keys failed.")
 
-def get_query_embedding(text):
+
+async def get_query_embedding(text):
     """Get embedding for a query."""
-    return get_embedding(text)
+    return await get_embedding(text)
 
 
 # --- Vector Search in Supabase ---
-def search_similar(query, limit=5):
+async def search_similar(query, limit=5):
     """Search for similar documents using vector similarity."""
-    embedding = get_query_embedding(query)
-    
-    result = supabase.rpc("match_documents", {
+    embedding = await get_query_embedding(query)
+
+    result = await db(lambda: supabase.rpc("match_documents", {
         "query_embedding": embedding,
         "match_threshold": 0.3,
         "match_count": limit
-    }).execute()
-    
+    }).execute())
+
     return result.data if result.data else []
 
 
@@ -112,267 +135,179 @@ def get_drive_service():
         try:
             info = json.loads(service_account_info)
         except Exception as e:
-            print("Failed to parse GOOGLE_SERVICE_ACCOUNT_JSON:", e)
-            
+            print("Failed to parse GOOGLE_SERVICE_ACCOUNT_JSON:", e, flush=True)
+
     if info:
         creds = service_account.Credentials.from_service_account_info(info)
     else:
         path = os.path.join(os.path.dirname(__file__), "..", "service-account.json")
         creds = service_account.Credentials.from_service_account_file(path)
-    
+
     return build('drive', 'v3', credentials=creds.with_scopes(
         ['https://www.googleapis.com/auth/drive.readonly']))
 
 
-def get_text_embedding_hf(text):
-    """Legacy function wrapper (kept for compatibility)."""
-    return get_embedding(text)
-
-
-def run_sync_logic(chat_id=None):
+async def run_sync_logic(chat_id=None):
     if chat_id:
-        send_telegram(chat_id, "بدأ عملية المزامنة (Restore)... جاري فحص الملفات.")
-        
+        await send_telegram(chat_id, "بدأ عملية المزامنة (Restore)... جاري فحص الملفات.")
+
     service = get_drive_service()
-    results = service.files().list(
+    results = await asyncio.to_thread(lambda: service.files().list(
         q=f"'{FOLDER_ID}' in parents and mimeType='application/pdf'",
         fields="files(id, name)"
-    ).execute()
+    ).execute())
     files = results.get('files', [])
-    
+
     if not files:
         if chat_id:
-            send_telegram(chat_id, "لم يتم العثور على أي ملفات PDF.")
+            await send_telegram(chat_id, "لم يتم العثور على أي ملفات PDF.")
         return "No PDF files found."
 
     # Fetch already synced files
-    synced_response = supabase.table("synced_files").select("file_id").execute()
+    synced_response = await db(lambda: supabase.table("synced_files").select("file_id").execute())
     synced_file_ids = {row["file_id"] for row in synced_response.data}
-    
+
     files_to_sync = [f for f in files if f['id'] not in synced_file_ids]
-    
+
     if not files_to_sync:
         if chat_id:
-            send_telegram(chat_id, "كل الملفات تم عمل sync لها مسبقاً. مفيش ملفات جديدة.")
+            await send_telegram(chat_id, "كل الملفات تم عمل sync لها مسبقاً. مفيش ملفات جديدة.")
         return "All files already synced."
 
     if chat_id:
-        send_telegram(chat_id, f"تم إيجاد {len(files_to_sync)} ملف جديد. جاري التحويل...")
+        await send_telegram(chat_id, f"تم إيجاد {len(files_to_sync)} ملف جديد. جاري التحويل...")
 
     text_splitter = RecursiveCharacterTextSplitter(chunk_size=800, chunk_overlap=150)
     total_chunks = 0
 
     for file_info in files_to_sync:
         if chat_id:
-            send_telegram(chat_id, f"جاري معالجة: {file_info['name']}")
-            
-        request = service.files().get_media(fileId=file_info['id'])
+            await send_telegram(chat_id, f"جاري معالجة: {file_info['name']}")
+
+        request_obj = service.files().get_media(fileId=file_info['id'])
         fh = io.BytesIO()
-        downloader = MediaIoBaseDownload(fh, request)
-        done = False
-        while not done:
-            _, done = downloader.next_chunk()
+        downloader = MediaIoBaseDownload(fh, request_obj)
+
+        def _download():
+            nonlocal fh, downloader
+            done = False
+            while not done:
+                _, done = downloader.next_chunk()
+        await asyncio.to_thread(_download)
 
         fh.seek(0)
         reader = PdfReader(fh)
         text = "".join([p.extract_text() or "" for p in reader.pages])
-        
+
         chunks = text_splitter.split_text(text)
         for i, chunk in enumerate(chunks):
-            emb = get_embedding(chunk)
-            supabase.table("documents").insert({
-                "content": chunk,
-                "embedding": emb,
-                "metadata": json.dumps({"source": file_info['name'], "chunk": i})
-            }).execute()
+            emb = await get_embedding(chunk)
+            await db(lambda c=chunk, e=emb, fn=file_info['name'], idx=i: supabase.table("documents").insert({
+                "content": c,
+                "embedding": e,
+                "metadata": json.dumps({"source": fn, "chunk": idx})
+            }).execute())
             total_chunks += 1
-            
+
         # Mark as synced
-        supabase.table("synced_files").insert({
-            "file_id": file_info['id'],
-            "file_name": file_info['name']
-        }).execute()
-            
+        await db(lambda fid=file_info['id'], fname=file_info['name']: supabase.table("synced_files").insert({
+            "file_id": fid,
+            "file_name": fname
+        }).execute())
+
     if chat_id:
-        send_telegram(chat_id, f"تم الانتهاء بنجاح! تمت معالجة {len(files_to_sync)} ملف ({total_chunks} أجزاء).")
-        
+        await send_telegram(chat_id, f"تم الانتهاء بنجاح! تمت معالجة {len(files_to_sync)} ملف ({total_chunks} أجزاء).")
+
     return f"Synced {len(files_to_sync)} files ({total_chunks} chunks)."
 
 
-# --- Bot Logic ---
-def ask_ollama(system_prompt, user_message):
-    global current_ollama_key_index
-    if not OLLAMA_KEYS:
-        return "Sorry, no Ollama API keys configured."
-    
-    for attempt in range(len(OLLAMA_KEYS)):
-        current_key = OLLAMA_KEYS[current_ollama_key_index]
+# --- Send Functions (all async) ---
+async def send_telegram(chat_id, text):
+    for i in range(0, len(str(text)), 4000):
         try:
-            response = httpx.post(
-                "https://ollama.com/api/chat",
-                headers={"Authorization": f"Bearer {current_key}", "Content-Type": "application/json"},
-                json={
-                    "model": "gpt-oss:120b",
-                    "messages": [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": user_message}
-                    ],
-                    "stream": False
-                },
-                timeout=120
-            )
-            if response.status_code == 200:
-                return response.json().get("message", {}).get("content", "Sorry, I couldn't process that.")
-            elif response.status_code in [401, 403, 429, 500, 502, 503, 504]:
-                print(f"Ollama key {current_ollama_key_index} failed ({response.status_code}), switching...")
-                current_ollama_key_index = (current_ollama_key_index + 1) % len(OLLAMA_KEYS)
-                continue
-        except Exception as e:
-            print(f"Ollama key {current_ollama_key_index} exception: {e}, switching...")
-            current_ollama_key_index = (current_ollama_key_index + 1) % len(OLLAMA_KEYS)
-            continue
-    return "Sorry, I couldn't process that."
-
-
-# --- Robust HTTP Session with retries for HF Spaces ---
-from requests.adapters import HTTPAdapter
-from urllib3.util.retry import Retry
-
-def _make_session():
-    s = requests.Session()
-    retries = Retry(
-        total=3,
-        backoff_factor=1,
-        status_forcelist=[500, 502, 503, 504],
-        allowed_methods=["POST", "GET"],
-    )
-    adapter = HTTPAdapter(max_retries=retries)
-    s.mount("https://", adapter)
-    s.mount("http://", adapter)
-    return s
-
-http_session = _make_session()
-
-
-def send_telegram(chat_id, text):
-    for i in range(0, len(text), 4000):
-        try:
-            r = httpx.post(f"{TELEGRAM_API}/sendMessage",
-                json={"chat_id": chat_id, "text": text[i:i+4000]}, timeout=60)
+            r = await _client.post(f"{TELEGRAM_API}/sendMessage",
+                json={"chat_id": chat_id, "text": str(text)[i:i+4000]})
             if r.status_code != 200:
-                print(f"[TG SEND ERROR] {r.status_code}: {r.text}")
-                try:
-                    supabase.table("chat_history").insert({
-                        "chat_id": chat_id,
-                        "role": "assistant",
-                        "content": f"[DEBUG TG ERROR] {r.status_code}: {r.text}"
-                    }).execute()
-                except: pass
+                print(f"[TG SEND ERROR] {r.status_code}: {r.text}", flush=True)
         except Exception as e:
-            print(f"[TG SEND FAIL] {e}")
-            try:
-                supabase.table("chat_history").insert({
-                    "chat_id": chat_id,
-                    "role": "assistant",
-                    "content": f"[DEBUG TG EXCEPTION] {e}"
-                }).execute()
-            except: pass
+            print(f"[TG SEND FAIL] {e}", flush=True)
 
-def send_telegram_typing(chat_id):
+
+async def send_telegram_typing(chat_id):
     try:
-        httpx.post(f"{TELEGRAM_API}/sendChatAction",
-            json={"chat_id": chat_id, "action": "typing"}, timeout=15)
+        await _client.post(f"{TELEGRAM_API}/sendChatAction",
+            json={"chat_id": chat_id, "action": "typing"})
     except:
         pass
 
-def send_telegram_keyboard(chat_id, text, keyboard):
-    try:
-        r = httpx.post(f"{TELEGRAM_API}/sendMessage",
-            json={"chat_id": chat_id, "text": text, "reply_markup": keyboard}, 
-            timeout=60)
-        if r.status_code != 200:
-            print(f"[TG KEYBOARD ERROR] {r.status_code}: {r.text}")
-            try:
-                supabase.table("chat_history").insert({
-                    "chat_id": chat_id,
-                    "role": "assistant",
-                    "content": f"[DEBUG TG KBD ERROR] {r.status_code}: {r.text}"
-                }).execute()
-            except: pass
-    except Exception as e:
-        print(f"[TG KEYBOARD FAIL] {e}")
 
-def mark_whatsapp_read(message_id):
+async def send_telegram_keyboard(chat_id, text, keyboard):
+    try:
+        r = await _client.post(f"{TELEGRAM_API}/sendMessage",
+            json={"chat_id": chat_id, "text": text, "reply_markup": keyboard})
+        if r.status_code != 200:
+            print(f"[TG KEYBOARD ERROR] {r.status_code}: {r.text}", flush=True)
+    except Exception as e:
+        print(f"[TG KEYBOARD FAIL] {e}", flush=True)
+
+
+async def mark_whatsapp_read(message_id):
     if not WHATSAPP_PHONE_ID or not WHATSAPP_TOKEN:
         return
     try:
         url = f"https://graph.facebook.com/v25.0/{WHATSAPP_PHONE_ID}/messages"
         headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
-        httpx.post(url, headers=headers, json={
+        await _client.post(url, headers=headers, json={
             "messaging_product": "whatsapp",
             "status": "read",
             "message_id": message_id
-        }, timeout=15)
+        })
     except:
         pass
 
-def send_whatsapp(to_phone, text):
+
+async def send_whatsapp(to_phone, text):
     if not WHATSAPP_PHONE_ID or not WHATSAPP_TOKEN:
-        print("WhatsApp credentials missing.")
+        print("WhatsApp credentials missing.", flush=True)
         return
     url = f"https://graph.facebook.com/v25.0/{WHATSAPP_PHONE_ID}/messages"
     headers = {
         "Authorization": f"Bearer {WHATSAPP_TOKEN}",
         "Content-Type": "application/json"
     }
-    for i in range(0, len(text), 4000):
+    for i in range(0, len(str(text)), 4000):
         data = {
             "messaging_product": "whatsapp",
             "to": to_phone,
             "type": "text",
             "text": {
-                "body": text[i:i+4000]
+                "body": str(text)[i:i+4000]
             }
         }
         try:
-            r = httpx.post(url, headers=headers, json=data, timeout=60)
-            print(f"[WA SEND] Status: {r.status_code} | Response: {r.text}")
-            if r.status_code != 200:
-                try:
-                    supabase.table("whatsapp_chat_history").insert({
-                        "phone_number": to_phone,
-                        "role": "assistant",
-                        "content": f"[DEBUG WA ERROR]: {r.status_code} - {r.text}"
-                    }).execute()
-                except Exception as db_err:
-                    print("Debug DB fail:", db_err)
+            r = await _client.post(url, headers=headers, json=data)
+            print(f"[WA SEND] Status: {r.status_code}", flush=True)
         except Exception as e:
-            print(f"Failed to send WA message: {e}")
-            try:
-                supabase.table("whatsapp_chat_history").insert({
-                    "phone_number": to_phone,
-                    "role": "assistant",
-                    "content": f"[DEBUG WA EXCEPTION]: {str(e)}"
-                }).execute()
-            except:
-                pass
+            print(f"[WA SEND FAIL] {e}", flush=True)
 
+
+# --- RAG Response ---
 GREETINGS = {"hi", "hello", "hey", "هلا", "اهلا", "مرحبا", "هاي", "السلام عليكم", "ازيك", "ازيكم", "صباح الخير", "مساء الخير", "يا مستر", "مستر"}
 
-def get_rag_response(user_id, text, history_table, user_column):
+
+async def get_rag_response(user_id, text, history_table, user_column):
     # Smart: skip RAG search for greetings/short messages
     text_lower = text.strip().lower()
     is_greeting = text_lower in GREETINGS or len(text_lower) < 4
-    
+
     if is_greeting:
         similar_docs = []
-        print(f"[SMART] Skipped RAG for greeting: '{text_lower}'")
+        print(f"[SMART] Skipped RAG for greeting: '{text_lower}'", flush=True)
     else:
         # Use fewer docs for short questions, more for complex ones
         doc_limit = 5 if len(text) < 30 else 10
-        similar_docs = search_similar(text, limit=doc_limit)
-        print(f"[SMART] RAG search with {doc_limit} docs for: '{text[:40]}'")
-
+        similar_docs = await search_similar(text, limit=doc_limit)
+        print(f"[SMART] RAG search with {doc_limit} docs for: '{text[:40]}'", flush=True)
 
     def get_source(d):
         meta = d.get('metadata', {})
@@ -389,7 +324,7 @@ def get_rag_response(user_id, text, history_table, user_column):
             available_sources.add(get_source(d))
         context = "\n\n".join([f"[{get_source(d)}]\n{d['content']}" for d in similar_docs])
     else:
-        result = supabase.table("documents").select("content, metadata").limit(20).execute()
+        result = await db(lambda: supabase.table("documents").select("content, metadata").limit(20).execute())
         context = "\n\n".join([f"[{get_source(d)}]\n{d['content']}" for d in result.data])[:8000]
         for d in result.data:
             available_sources.add(get_source(d))
@@ -467,11 +402,11 @@ COURSE MATERIALS:
     history_limit = 6 if is_greeting else 15
     history = []
     try:
-        history_response = supabase.table(history_table).select("role, content").eq(user_column, user_id).order("created_at", desc=True).limit(history_limit).execute()
+        history_response = await db(lambda: supabase.table(history_table).select("role, content").eq(user_column, user_id).order("created_at", desc=True).limit(history_limit).execute())
         history = list(reversed(history_response.data))
-        print(f"[HISTORY] Loaded {len(history)}/{history_limit} messages for {user_id}")
+        print(f"[HISTORY] Loaded {len(history)}/{history_limit} messages for {user_id}", flush=True)
     except Exception as e:
-        print("Failed to fetch chat history:", e)
+        print("Failed to fetch chat history:", e, flush=True)
 
     messages = [{"role": "system", "content": system_prompt}]
     for h in history:
@@ -479,21 +414,21 @@ COURSE MATERIALS:
     messages.append({"role": "user", "content": text})
 
     try:
-        supabase.table(history_table).insert({
+        await db(lambda: supabase.table(history_table).insert({
             user_column: user_id,
             "role": "user",
             "content": text
-        }).execute()
+        }).execute())
     except Exception as e:
-        print("Failed to save user history:", e)
+        print("Failed to save user history:", e, flush=True)
 
     global current_ollama_key_index
     answer = "Sorry, I couldn't generate an answer."
-    
+
     for attempt in range(max(1, len(OLLAMA_KEYS))):
         current_key = OLLAMA_KEYS[current_ollama_key_index] if OLLAMA_KEYS else ""
         try:
-            response = httpx.post(
+            response = await _client.post(
                 "https://ollama.com/api/chat",
                 json={
                     "model": "gpt-oss:120b",
@@ -501,47 +436,45 @@ COURSE MATERIALS:
                     "stream": False
                 },
                 headers={"Authorization": f"Bearer {current_key}"},
-                timeout=120
             )
             if response.status_code == 200:
                 answer = response.json().get("message", {}).get("content", "Sorry, I couldn't generate an answer.")
                 break
             else:
-                print(f"Ollama key {current_ollama_key_index} returned {response.status_code}, switching...")
+                print(f"Ollama key {current_ollama_key_index} returned {response.status_code}, switching...", flush=True)
                 if OLLAMA_KEYS:
                     current_ollama_key_index = (current_ollama_key_index + 1) % len(OLLAMA_KEYS)
                 continue
         except Exception as e:
-            print(f"Ollama key {current_ollama_key_index} threw {e}, switching...")
+            print(f"Ollama key {current_ollama_key_index} threw {e}, switching...", flush=True)
             if OLLAMA_KEYS:
                 current_ollama_key_index = (current_ollama_key_index + 1) % len(OLLAMA_KEYS)
             continue
-    
-    import re
+
     # 1. Remove block tags + their content (model internal reasoning)
     block_tags = r'<(?:thinking|thought|reasoning|reflect|internal|scratchpad|meta|plan|analysis|step_by_step|chain_of_thought|inner_monologue)>.*?</(?:thinking|thought|reasoning|reflect|internal|scratchpad|meta|plan|analysis|step_by_step|chain_of_thought|inner_monologue)>'
     answer = re.sub(block_tags, '', answer, flags=re.DOTALL | re.IGNORECASE).strip()
-    
+
     # 2. Remove any remaining XML/HTML-style tags but keep their text content
     answer = re.sub(r'<[^>]+>', '', answer).strip()
-    
+
     if not answer:
         answer = "عذراً، لم أتمكن من إنشاء إجابة. حاول مرة أخرى."
-    
+
     try:
-        supabase.table(history_table).insert({
+        await db(lambda: supabase.table(history_table).insert({
             user_column: user_id,
             "role": "assistant",
             "content": answer
-        }).execute()
+        }).execute())
     except Exception as e:
-        print("Failed to save assistant history:", e)
+        print("Failed to save assistant history:", e, flush=True)
 
     return answer
 
 
-# --- Routes ---
-def process_telegram_message(chat_id, text, msg_info):
+# --- Process Messages (async) ---
+async def process_telegram_message(chat_id, text, msg_info):
     print(f"[TG] >>> Processing msg from {chat_id}: '{text[:50]}'", flush=True)
     try:
         # Check for contact sharing
@@ -549,27 +482,29 @@ def process_telegram_message(chat_id, text, msg_info):
             phone = msg_info["contact"].get("phone_number")
             first_name = msg_info.get("from", {}).get("first_name", "")
             username = msg_info.get("from", {}).get("username", "")
-            
+
             try:
-                supabase.table("bot_users").upsert({
+                await db(lambda: supabase.table("bot_users").upsert({
                     "chat_id": chat_id,
                     "phone_number": phone,
                     "name": first_name,
                     "username": username
-                }).execute()
+                }).execute())
             except Exception as e:
-                print("Failed to save user:", e)
-            
+                print("Failed to save user:", e, flush=True)
+
             remove_kb = {"remove_keyboard": True}
-            send_telegram_keyboard(chat_id, "Hi welcome to Mr Maged's bot! 🎓\n\nHere you can feel free to ask any question you want and don't worry, I'm always here to help you 😊", remove_kb)
+            await send_telegram_keyboard(chat_id, "Hi welcome to Mr Maged's bot! 🎓\n\nHere you can feel free to ask any question you want and don't worry, I'm always here to help you 😊", remove_kb)
             return
 
         if not text:
             return
 
         # Check if user is registered and has phone
-        user_check = supabase.table("bot_users").select("phone_number").eq("chat_id", chat_id).execute()
+        print(f"[TG] Checking user registration for {chat_id}...", flush=True)
+        user_check = await db(lambda: supabase.table("bot_users").select("phone_number").eq("chat_id", chat_id).execute())
         has_phone = len(user_check.data) > 0 and user_check.data[0].get("phone_number") is not None
+        print(f"[TG] User {chat_id} has_phone={has_phone}", flush=True)
 
         if text == "/start":
             if not has_phone:
@@ -578,11 +513,11 @@ def process_telegram_message(chat_id, text, msg_info):
                     "resize_keyboard": True,
                     "one_time_keyboard": True
                 }
-                send_telegram_keyboard(chat_id, 
-                    "Hi welcome to Mr Maged's bot! 🎓\n\nHere you can feel free to ask any question you want and don't worry, I'm always here to help you 😊\n\nPlease share your phone number first by pressing the button below:", 
+                await send_telegram_keyboard(chat_id,
+                    "Hi welcome to Mr Maged's bot! 🎓\n\nHere you can feel free to ask any question you want and don't worry, I'm always here to help you 😊\n\nPlease share your phone number first by pressing the button below:",
                     keyboard)
             else:
-                send_telegram(chat_id, "Hi welcome back! 🎓\n\nFeel free to ask me anything about English, I'm always here to help you 😊")
+                await send_telegram(chat_id, "Hi welcome back! 🎓\n\nFeel free to ask me anything about English, I'm always here to help you 😊")
             return
 
         if not has_phone:
@@ -591,42 +526,42 @@ def process_telegram_message(chat_id, text, msg_info):
                 "resize_keyboard": True,
                 "one_time_keyboard": True
             }
-            send_telegram_keyboard(chat_id, "عفواً، لازم تشارك رقم التليفون الأول عشان أقدر أجاوبك.", keyboard)
+            await send_telegram_keyboard(chat_id, "عفواً، لازم تشارك رقم التليفون الأول عشان أقدر أجاوبك.", keyboard)
             return
 
         # /review command - available for ALL users
         if text.startswith("/review"):
             review_text = text[7:].strip()
             if not review_text:
-                send_telegram(chat_id, "📝 To leave a review, type:\n/review followed by your feedback\n\nExample:\n/review The bot is very helpful!")
+                await send_telegram(chat_id, "📝 To leave a review, type:\n/review followed by your feedback\n\nExample:\n/review The bot is very helpful!")
                 return
             try:
                 first_name = msg_info.get("from", {}).get("first_name", "")
-                supabase.table("reviews").insert({
+                await db(lambda: supabase.table("reviews").insert({
                     "platform": "telegram",
                     "user_id": str(chat_id),
                     "user_name": first_name,
                     "review": review_text
-                }).execute()
-                send_telegram(chat_id, "Thank you so much for your feedback! 🙏😊\nYour review has been saved successfully ✅")
+                }).execute())
+                await send_telegram(chat_id, "Thank you so much for your feedback! 🙏😊\nYour review has been saved successfully ✅")
             except Exception as e:
                 print(f"Failed to save review: {e}", flush=True)
-                send_telegram(chat_id, "Sorry, something went wrong. Please try again later.")
+                await send_telegram(chat_id, "Sorry, something went wrong. Please try again later.")
             return
 
         # Restrict all commands (except /start and /review) to admins only
         if text.startswith("/") and text not in ["/start"]:
             if chat_id not in ADMIN_CHAT_IDS:
-                send_telegram(chat_id, "عفواً، ليس لديك صلاحية لاستخدام هذا الأمر.")
+                await send_telegram(chat_id, "عفواً، ليس لديك صلاحية لاستخدام هذا الأمر.")
                 return
 
         if text == "/restore":
-            run_sync_logic(chat_id)
+            await run_sync_logic(chat_id)
             return
 
         if text == "/files":
             try:
-                result = supabase.table("documents").select("metadata").execute()
+                result = await db(lambda: supabase.table("documents").select("metadata").execute())
                 sources = set()
                 for d in result.data:
                     meta = d.get('metadata', {})
@@ -637,116 +572,119 @@ def process_telegram_message(chat_id, text, msg_info):
                             meta = {}
                     if isinstance(meta, dict) and 'source' in meta:
                         sources.add(meta['source'])
-                
+
                 if sources:
                     files_msg = "📚 الملفات الموجودة حالياً في الذاكرة:\n\n" + "\n".join([f"🔹 {s}" for s in sorted(sources)])
                 else:
                     files_msg = "مفيش ملفات موجودة حالياً."
-                
-                send_telegram(chat_id, files_msg)
+
+                await send_telegram(chat_id, files_msg)
             except Exception as e:
-                print("Failed to fetch files:", e)
-                send_telegram(chat_id, "عذراً، حصل مشكلة في جلب قائمة الملفات.")
+                print("Failed to fetch files:", e, flush=True)
+                await send_telegram(chat_id, "عذراً، حصل مشكلة في جلب قائمة الملفات.")
             return
 
         # Send typing indicator then process
-        send_telegram_typing(chat_id)
+        await send_telegram_typing(chat_id)
         print(f"[TG] Getting RAG response for {chat_id}...", flush=True)
-        answer = get_rag_response(chat_id, text, "chat_history", "chat_id")
+        answer = await get_rag_response(chat_id, text, "chat_history", "chat_id")
         print(f"[TG] Got answer ({len(answer)} chars), sending to {chat_id}...", flush=True)
-        send_telegram(chat_id, answer)
+        await send_telegram(chat_id, answer)
         print(f"[TG] <<< Done for {chat_id}", flush=True)
 
     except Exception as e:
         print(f"[TG] !!! Processing error for {chat_id}: {e}", flush=True)
         try:
-            send_telegram(chat_id, f"عذراً، حصل خطأ تقني: {str(e)[:200]}")
+            await send_telegram(chat_id, f"عذراً، حصل خطأ تقني: {str(e)[:200]}")
         except Exception as e2:
             print(f"[TG] !!! Failed to send error msg too: {e2}", flush=True)
 
-def process_whatsapp_message(data):
+
+async def process_whatsapp_message(data):
     print(f"[WA] >>> Processing incoming WA data", flush=True)
     try:
         if "object" in data and data["object"] == "whatsapp_business_account":
             for entry in data.get("entry", []):
                 for change in entry.get("changes", []):
                     value = change.get("value", {})
-                    
+
                     if "statuses" in value:
                         for status in value["statuses"]:
                             if status.get("status") == "failed":
                                 try:
-                                    supabase.table("whatsapp_chat_history").insert({
+                                    await db(lambda: supabase.table("whatsapp_chat_history").insert({
                                         "phone_number": status.get("recipient_id", "unknown"),
                                         "role": "assistant",
                                         "content": f"[DEBUG STATUS FAILED]: {status}"
-                                    }).execute()
+                                    }).execute())
                                 except:
                                     pass
 
                     if "messages" in value:
                         messages = value["messages"]
                         contacts = value.get("contacts", [])
-                        
+
                         for msg in messages:
                             if msg.get("type") != "text":
                                 continue
-                                
+
                             phone = msg.get("from")
                             text = msg.get("text", {}).get("body", "")
                             msg_id = msg.get("id")
-                            
+
                             contact_name = contacts[0].get("profile", {}).get("name", "User") if contacts else "User"
 
                             # Mark as read (blue ticks) immediately
-                            mark_whatsapp_read(msg_id)
+                            await mark_whatsapp_read(msg_id)
 
                             try:
-                                supabase.table("whatsapp_users").upsert(
-                                    {"phone_number": phone, "name": contact_name},
+                                await db(lambda p=phone, cn=contact_name: supabase.table("whatsapp_users").upsert(
+                                    {"phone_number": p, "name": cn},
                                     on_conflict="phone_number"
-                                ).execute()
+                                ).execute())
                             except Exception as e:
-                                print("Failed to save WA user:", e)
+                                print("Failed to save WA user:", e, flush=True)
 
-                            print(f"[WA] Processing message from {phone}: {text[:50]}")
+                            print(f"[WA] Processing message from {phone}: {text[:50]}", flush=True)
 
                             # Handle /review command on WhatsApp
                             if text.strip().lower().startswith("/review"):
                                 review_text = text[7:].strip()
                                 if not review_text:
-                                    send_whatsapp(phone, "📝 To leave a review, send:\n/review followed by your feedback\n\nExample:\n/review The bot is very helpful!")
+                                    await send_whatsapp(phone, "📝 To leave a review, send:\n/review followed by your feedback\n\nExample:\n/review The bot is very helpful!")
                                 else:
                                     try:
-                                        supabase.table("reviews").insert({
+                                        await db(lambda p=phone, cn=contact_name, rt=review_text: supabase.table("reviews").insert({
                                             "platform": "whatsapp",
-                                            "user_id": phone,
-                                            "user_name": contact_name,
-                                            "review": review_text
-                                        }).execute()
-                                        send_whatsapp(phone, "Thank you so much for your feedback! 🙏😊\nYour review has been saved successfully ✅")
+                                            "user_id": p,
+                                            "user_name": cn,
+                                            "review": rt
+                                        }).execute())
+                                        await send_whatsapp(phone, "Thank you so much for your feedback! 🙏😊\nYour review has been saved successfully ✅")
                                     except Exception as e:
                                         print(f"Failed to save WA review: {e}", flush=True)
-                                        send_whatsapp(phone, "Sorry, something went wrong. Please try again later.")
+                                        await send_whatsapp(phone, "Sorry, something went wrong. Please try again later.")
                                 continue
 
                             # Check if first message (welcome)
                             try:
-                                wa_history = supabase.table("whatsapp_chat_history").select("id").eq("phone_number", phone).limit(1).execute()
+                                wa_history = await db(lambda p=phone: supabase.table("whatsapp_chat_history").select("id").eq("phone_number", p).limit(1).execute())
                                 if not wa_history.data:
-                                    send_whatsapp(phone, "Hi welcome to Mr Maged's bot! 🎓\n\nHere you can feel free to ask any question you want and don't worry, I'm always here to help you 😊")
+                                    await send_whatsapp(phone, "Hi welcome to Mr Maged's bot! 🎓\n\nHere you can feel free to ask any question you want and don't worry, I'm always here to help you 😊")
                             except:
                                 pass
 
-                            answer = get_rag_response(phone, text, "whatsapp_chat_history", "phone_number")
-                            print(f"[WA] Got answer, sending to {phone}...")
-                            send_whatsapp(phone, answer)
-                            print(f"[WA] send_whatsapp completed for {phone}")
+                            answer = await get_rag_response(phone, text, "whatsapp_chat_history", "phone_number")
+                            print(f"[WA] Got answer, sending to {phone}...", flush=True)
+                            await send_whatsapp(phone, answer)
+                            print(f"[WA] <<< Done for {phone}", flush=True)
     except Exception as e:
-        print(f"WA processing error: {e}")
+        print(f"WA processing error: {e}", flush=True)
 
+
+# --- Routes ---
 @app.post("/webhook")
-async def webhook(request: Request, background_tasks: BackgroundTasks):
+async def webhook(request: Request):
     try:
         data = await request.json()
         msg = data.get("message", {})
@@ -755,13 +693,14 @@ async def webhook(request: Request, background_tasks: BackgroundTasks):
 
         if not chat_id:
             return JSONResponse({"ok": True})
-            
-        # Process message in background to avoid blocking event loop and timeout
-        background_tasks.add_task(process_telegram_message, chat_id, text, msg)
+
+        # Fire and forget — async task on the event loop (no threadpool needed)
+        asyncio.create_task(process_telegram_message(chat_id, text, msg))
         return JSONResponse({"ok": True})
     except Exception as e:
-        print(f"Webhook error: {e}")
+        print(f"Webhook error: {e}", flush=True)
         return JSONResponse({"status": "error", "detail": str(e)})
+
 
 @app.get("/whatsapp-webhook")
 async def verify_whatsapp_webhook(request: Request):
@@ -775,14 +714,15 @@ async def verify_whatsapp_webhook(request: Request):
             return PlainTextResponse(content=challenge)
     return JSONResponse({"status": "error"}, status_code=403)
 
+
 @app.post("/whatsapp-webhook")
-async def receive_whatsapp_webhook(request: Request, background_tasks: BackgroundTasks):
+async def receive_whatsapp_webhook(request: Request):
     try:
         data = await request.json()
-        background_tasks.add_task(process_whatsapp_message, data)
+        asyncio.create_task(process_whatsapp_message(data))
         return JSONResponse({"ok": True})
     except Exception as e:
-        print(f"WA Webhook error: {e}")
+        print(f"WA Webhook error: {e}", flush=True)
         return JSONResponse({"status": "error", "detail": str(e)})
 
 
@@ -790,7 +730,7 @@ async def receive_whatsapp_webhook(request: Request, background_tasks: Backgroun
 async def sync_now():
     """Endpoint for Cron Job - syncs with embeddings via HF API."""
     try:
-        report = run_sync_logic()
+        report = await run_sync_logic()
         return {"status": "success", "message": report}
     except Exception as e:
         return {"status": "error", "detail": str(e)}
@@ -799,10 +739,10 @@ async def sync_now():
 @app.get("/set-webhook")
 async def set_webhook(request: Request):
     base_url = str(request.base_url).rstrip("/")
-    r = httpx.get(f"{TELEGRAM_API}/setWebhook?url={base_url}/webhook", timeout=60)
+    r = await _client.get(f"{TELEGRAM_API}/setWebhook?url={base_url}/webhook")
     return r.json()
 
 
 @app.get("/")
 async def home():
-    return {"status": "running", "mode": "vector_search"}
+    return {"status": "running", "mode": "vector_search_async"}
