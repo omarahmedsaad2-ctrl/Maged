@@ -10,6 +10,7 @@ import json
 import time
 import sys
 import requests
+import httpx
 from fastapi import FastAPI, Request, BackgroundTasks
 from fastapi.responses import JSONResponse, PlainTextResponse
 from supabase import create_client, Client
@@ -63,7 +64,7 @@ def get_embedding(text):
         url = f"https://generativelanguage.googleapis.com/v1beta/models/gemini-embedding-2:embedContent?key={current_key}"
         
         try:
-            resp = requests.post(url, json={
+            resp = httpx.post(url, json={
                 "model": "models/gemini-embedding-2",
                 "content": {
                     "parts": [{"text": text}]
@@ -207,7 +208,7 @@ def ask_ollama(system_prompt, user_message):
     for attempt in range(len(OLLAMA_KEYS)):
         current_key = OLLAMA_KEYS[current_ollama_key_index]
         try:
-            response = requests.post(
+            response = httpx.post(
                 "https://ollama.com/api/chat",
                 headers={"Authorization": f"Bearer {current_key}", "Content-Type": "application/json"},
                 json={
@@ -256,7 +257,7 @@ http_session = _make_session()
 def send_telegram(chat_id, text):
     for i in range(0, len(text), 4000):
         try:
-            r = requests.post(f"{TELEGRAM_API}/sendMessage",
+            r = httpx.post(f"{TELEGRAM_API}/sendMessage",
                 json={"chat_id": chat_id, "text": text[i:i+4000]}, timeout=60)
             if r.status_code != 200:
                 print(f"[TG SEND ERROR] {r.status_code}: {r.text}")
@@ -279,14 +280,14 @@ def send_telegram(chat_id, text):
 
 def send_telegram_typing(chat_id):
     try:
-        requests.post(f"{TELEGRAM_API}/sendChatAction",
+        httpx.post(f"{TELEGRAM_API}/sendChatAction",
             json={"chat_id": chat_id, "action": "typing"}, timeout=15)
     except:
         pass
 
 def send_telegram_keyboard(chat_id, text, keyboard):
     try:
-        r = requests.post(f"{TELEGRAM_API}/sendMessage",
+        r = httpx.post(f"{TELEGRAM_API}/sendMessage",
             json={"chat_id": chat_id, "text": text, "reply_markup": keyboard}, 
             timeout=60)
         if r.status_code != 200:
@@ -307,7 +308,7 @@ def mark_whatsapp_read(message_id):
     try:
         url = f"https://graph.facebook.com/v25.0/{WHATSAPP_PHONE_ID}/messages"
         headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
-        requests.post(url, headers=headers, json={
+        httpx.post(url, headers=headers, json={
             "messaging_product": "whatsapp",
             "status": "read",
             "message_id": message_id
@@ -334,7 +335,7 @@ def send_whatsapp(to_phone, text):
             }
         }
         try:
-            r = requests.post(url, headers=headers, json=data, timeout=60)
+            r = httpx.post(url, headers=headers, json=data, timeout=60)
             print(f"[WA SEND] Status: {r.status_code} | Response: {r.text}")
             if r.status_code != 200:
                 try:
@@ -492,7 +493,7 @@ COURSE MATERIALS:
     for attempt in range(max(1, len(OLLAMA_KEYS))):
         current_key = OLLAMA_KEYS[current_ollama_key_index] if OLLAMA_KEYS else ""
         try:
-            response = requests.post(
+            response = httpx.post(
                 "https://ollama.com/api/chat",
                 json={
                     "model": "gpt-oss:120b",
@@ -798,7 +799,7 @@ async def sync_now():
 @app.get("/set-webhook")
 async def set_webhook(request: Request):
     base_url = str(request.base_url).rstrip("/")
-    r = http_session.get(f"{TELEGRAM_API}/setWebhook?url={base_url}/webhook", timeout=60)
+    r = httpx.get(f"{TELEGRAM_API}/setWebhook?url={base_url}/webhook", timeout=60)
     return r.json()
 
 
