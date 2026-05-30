@@ -45,8 +45,8 @@ async def startup_event():
 
 
 # --- WhatsApp Concurrency Control ---
-# Process up to 20 messages in parallel (RAG/Ollama - fast)
-_wa_semaphore = asyncio.Semaphore(20)
+# Process up to 50 messages in parallel (RAG/Ollama - fast)
+_wa_semaphore = asyncio.Semaphore(50)
 # HF throttling bypassed via Cloudflare Proxy, full speed enabled!
 
 
@@ -339,11 +339,11 @@ async def send_whatsapp(to_phone, text):
             "data": data
         }
         
-        for attempt in range(5):
+        for attempt in range(3):
             try:
                 # Full speed ahead, no send gate needed!
                 r = await asyncio.wait_for(
-                    _client.post(proxy_url, headers=proxy_headers, json=payload), timeout=30
+                    _client.post(proxy_url, headers=proxy_headers, json=payload), timeout=10
                 )
                 if r.status_code == 200:
                     print(f"[WA SEND] OK to {to_phone} via CF", flush=True)
@@ -354,8 +354,8 @@ async def send_whatsapp(to_phone, text):
             except Exception as e:
                 print(f"[WA SEND FAIL] attempt {attempt+1}: {type(e).__name__}", flush=True)
             
-            if attempt < 4:
-                await asyncio.sleep(min(attempt + 1, 5))
+            if attempt < 2:
+                await asyncio.sleep(1)
 
 
 # --- RAG Response ---
