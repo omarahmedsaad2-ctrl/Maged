@@ -45,10 +45,9 @@ async def startup_event():
 
 
 # --- WhatsApp Concurrency Control ---
-# Process up to 20 messages in parallel (RAG/Ollama - fast, no Meta network)
+# Process up to 20 messages in parallel (RAG/Ollama - fast)
 _wa_semaphore = asyncio.Semaphore(20)
-# But only allow 3 concurrent SENDS to graph.facebook.com (HF throttles more)
-_wa_send_gate = asyncio.Semaphore(3)
+# HF throttling bypassed via Cloudflare Proxy, full speed enabled!
 
 
 async def _process_wa_with_limit(data):
@@ -290,34 +289,41 @@ async def send_telegram_keyboard(chat_id, text, keyboard):
 
 
 async def mark_whatsapp_read(message_id):
-    """Mark message as read (blue ticks) - rate limited."""
+    """Mark message as read (blue ticks) via CF Proxy."""
     if not WHATSAPP_PHONE_ID or not WHATSAPP_TOKEN:
         return
     try:
-        async with _wa_send_gate:
-            url = f"https://graph.facebook.com/v25.0/{WHATSAPP_PHONE_ID}/messages"
-            headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
-            await asyncio.wait_for(
-                _client.post(url, headers=headers, json={
+        # Route through Cloudflare Proxy
+        proxy_url = "https://wa-proxy.omarahmedsaad2.workers.dev"
+        target_url = f"https://graph.facebook.com/v25.0/{WHATSAPP_PHONE_ID}/messages"
+        headers = {"X-Proxy-Secret": "maged-bot-2024-secret", "Content-Type": "application/json"}
+        
+        await asyncio.wait_for(
+            _client.post(proxy_url, headers=headers, json={
+                "url": target_url,
+                "headers": {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"},
+                "data": {
                     "messaging_product": "whatsapp",
                     "status": "read",
                     "message_id": message_id
-                }), timeout=10
-            )
+                }
+            }), timeout=10
+        )
     except:
         pass
 
 
 async def send_whatsapp(to_phone, text):
-    """Send WhatsApp message - rate limited to prevent HF throttling."""
+    """Send WhatsApp message via CF Proxy to prevent HF throttling."""
     if not WHATSAPP_PHONE_ID or not WHATSAPP_TOKEN:
         print("WhatsApp credentials missing.", flush=True)
         return
-    url = f"https://graph.facebook.com/v25.0/{WHATSAPP_PHONE_ID}/messages"
-    headers = {
-        "Authorization": f"Bearer {WHATSAPP_TOKEN}",
-        "Content-Type": "application/json"
-    }
+        
+    proxy_url = "https://wa-proxy.omarahmedsaad2.workers.dev"
+    target_url = f"https://graph.facebook.com/v25.0/{WHATSAPP_PHONE_ID}/messages"
+    proxy_headers = {"X-Proxy-Secret": "maged-bot-2024-secret", "Content-Type": "application/json"}
+    target_headers = {"Authorization": f"Bearer {WHATSAPP_TOKEN}", "Content-Type": "application/json"}
+
     for i in range(0, len(str(text)), 4000):
         chunk = str(text)[i:i+4000]
         data = {
@@ -326,23 +332,28 @@ async def send_whatsapp(to_phone, text):
             "type": "text",
             "text": {"body": chunk}
         }
+        
+        payload = {
+            "url": target_url,
+            "headers": target_headers,
+            "data": data
+        }
+        
         for attempt in range(5):
             try:
-                async with _wa_send_gate:
-                    r = await asyncio.wait_for(
-                        _client.post(url, headers=headers, json=data), timeout=30
-                    )
-                    # Small delay after send to prevent HF throttling
-                    await asyncio.sleep(0.3)
+                # Full speed ahead, no send gate needed!
+                r = await asyncio.wait_for(
+                    _client.post(proxy_url, headers=proxy_headers, json=payload), timeout=30
+                )
                 if r.status_code == 200:
-                    print(f"[WA SEND] OK to {to_phone}", flush=True)
+                    print(f"[WA SEND] OK to {to_phone} via CF", flush=True)
                     break
                 print(f"[WA SEND ERROR] attempt {attempt+1}: {r.status_code}: {r.text[:200]}", flush=True)
             except asyncio.TimeoutError:
                 print(f"[WA SEND TIMEOUT] attempt {attempt+1} for {to_phone}", flush=True)
             except Exception as e:
                 print(f"[WA SEND FAIL] attempt {attempt+1}: {type(e).__name__}", flush=True)
-            # Backoff: 1s, 2s, 3s, 5s
+            
             if attempt < 4:
                 await asyncio.sleep(min(attempt + 1, 5))
 
