@@ -244,9 +244,10 @@ async def run_sync_logic(chat_id=None):
 
 
 # --- Send Functions (all async with retry + hard timeouts) ---
-async def _tg_post(url, json_data, timeout=30):
-    """POST to Telegram API with a hard asyncio timeout."""
-    return await asyncio.wait_for(_client.post(url, json=json_data), timeout=timeout)
+async def _tg_post(url, json_data, timeout=15):
+    """POST to Telegram API using a fresh client to prevent deadlocks on Hugging Face."""
+    async with httpx.AsyncClient(verify=False) as client:
+        return await client.post(url, json=json_data, timeout=timeout)
 
 
 async def send_telegram(chat_id, text):
