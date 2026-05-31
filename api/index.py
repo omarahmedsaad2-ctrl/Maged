@@ -244,10 +244,9 @@ async def run_sync_logic(chat_id=None):
 
 
 # --- Send Functions (all async with retry + hard timeouts) ---
-async def _tg_post(url, json_data, timeout=15):
-    """POST to Telegram API using a fresh client to prevent deadlocks."""
-    async with httpx.AsyncClient(verify=False) as client:
-        return await client.post(url, json=json_data, timeout=timeout)
+async def _tg_post(url, json_data, timeout=30):
+    """POST to Telegram API with a hard asyncio timeout."""
+    return await asyncio.wait_for(_client.post(url, json=json_data), timeout=timeout)
 
 
 async def send_telegram(chat_id, text):
@@ -366,37 +365,75 @@ async def send_whatsapp(to_phone, text):
                 await asyncio.sleep(1)
 
 
-async def broadcast_update():
-    """Broadcast an update message to all Telegram and WhatsApp users concurrently."""
+async def _safe_send_telegram(chat_id, text):
+    """Send telegram message, return True on success, False on failure."""
+    try:
+        await send_telegram(chat_id, text)
+        return True
+    except Exception:
+        return False
+
+
+async def _safe_send_whatsapp(phone, text):
+    """Send whatsapp message, return True on success, False on failure."""
+    try:
+        await send_whatsapp(phone, text)
+        return True
+    except Exception:
+        return False
+
+
+async def broadcast_update(admin_chat_id=None):
+    """Broadcast update to all TG users + WA users active in last 24h."""
     message = "تم تحديث البوت بميزات جديدة وأصبح أسرع وأذكى! 🚀\nنعتذر إذا قمت بإرسال رسالة في آخر 5 دقائق ولم يتم الرد عليها بسبب التحديث، يمكنك إعادة إرسالها الآن. 😊"
-    
-    async def send_tg():
-        try:
-            tg_users = await db(lambda: supabase.table("bot_users").select("chat_id").execute())
-            if tg_users.data:
-                print(f"[BROADCAST] Sending to {len(tg_users.data)} Telegram users...", flush=True)
-                # Create a task for each user and run concurrently with max concurrency
-                tasks = []
-                for u in tg_users.data:
-                    tasks.append(send_telegram(u["chat_id"], message))
-                await asyncio.gather(*tasks, return_exceptions=True)
-        except Exception as e:
-            print(f"[BROADCAST] Telegram error: {e}", flush=True)
-            
-    async def send_wa():
-        try:
-            wa_users = await db(lambda: supabase.table("whatsapp_users").select("phone_number").execute())
-            if wa_users.data:
-                print(f"[BROADCAST] Sending to {len(wa_users.data)} WhatsApp users...", flush=True)
-                tasks = []
-                for u in wa_users.data:
-                    tasks.append(send_whatsapp(u["phone_number"], message))
-                await asyncio.gather(*tasks, return_exceptions=True)
-        except Exception as e:
-            print(f"[BROADCAST] WhatsApp error: {e}", flush=True)
-            
-    await asyncio.gather(send_tg(), send_wa())
-    print("[BROADCAST] Finished sending update messages.", flush=True)
+    BATCH_SIZE = 25
+    sent_tg, failed_tg, sent_wa, failed_wa, skipped_wa = 0, 0, 0, 0, 0
+
+    # --- Telegram (no 24h restriction) ---
+    try:
+        tg_users = await db(lambda: supabase.table("bot_users").select("chat_id").execute())
+        if tg_users.data:
+            total = len(tg_users.data)
+            print(f"[BROADCAST] Sending to {total} Telegram users...", flush=True)
+            for i in range(0, total, BATCH_SIZE):
+                batch = tg_users.data[i:i+BATCH_SIZE]
+                results = await asyncio.gather(
+                    *[_safe_send_telegram(u["chat_id"], message) for u in batch]
+                )
+                sent_tg += sum(1 for r in results if r is True)
+                failed_tg += sum(1 for r in results if r is not True)
+                if i + BATCH_SIZE < total:
+                    await asyncio.sleep(1)
+    except Exception as e:
+        print(f"[BROADCAST] Telegram error: {e}", flush=True)
+
+    # --- WhatsApp (ONLY users active in last 24h - respects session window) ---
+    try:
+        active_wa = await db(lambda: supabase.rpc("get_active_wa_users_24h").execute())
+        if active_wa.data:
+            phones = [r["phone_number"] for r in active_wa.data]
+            total = len(phones)
+            print(f"[BROADCAST] Sending to {total} active WhatsApp users (24h window)...", flush=True)
+            for i in range(0, total, BATCH_SIZE):
+                batch = phones[i:i+BATCH_SIZE]
+                results = await asyncio.gather(
+                    *[_safe_send_whatsapp(p, message) for p in batch]
+                )
+                sent_wa += sum(1 for r in results if r is True)
+                failed_wa += sum(1 for r in results if r is not True)
+                if i + BATCH_SIZE < total:
+                    await asyncio.sleep(1)
+        # Count skipped
+        all_wa = await db(lambda: supabase.table("whatsapp_users").select("phone_number", count="exact").execute())
+        total_wa = all_wa.count if hasattr(all_wa, 'count') and all_wa.count else 0
+        skipped_wa = max(0, total_wa - (sent_wa + failed_wa))
+    except Exception as e:
+        print(f"[BROADCAST] WhatsApp error: {e}", flush=True)
+
+    report = f"📊 تقرير البث:\n✅ تيليجرام: {sent_tg} نجح / {failed_tg} فشل\n✅ واتساب: {sent_wa} نجح / {failed_wa} فشل\n⏭️ واتساب تم تخطيهم (مش نشطين 24 ساعة): {skipped_wa}"
+    print(f"[BROADCAST] {report}", flush=True)
+    if admin_chat_id:
+        await send_telegram(admin_chat_id, report)
 
 
 async def summarize_conversation_task(user_id, platform, history_table, user_column):
@@ -990,12 +1027,12 @@ async def process_telegram_inline(chat_id, text, msg_info):
             }
             
         if text == "/update":
-            # Start background broadcast update
-            asyncio.create_task(broadcast_update())
+            # Start background broadcast update with admin report
+            asyncio.create_task(broadcast_update(admin_chat_id=chat_id))
             return {
                 "method": "sendMessage",
                 "chat_id": chat_id,
-                "text": "📢 جاري إرسال رسالة التحديث لجميع الطلاب على تيليجرام وواتساب..."
+                "text": "📢 جاري إرسال رسالة التحديث لجميع الطلاب على تيليجرام وواتساب...\nهيوصلك تقرير لما يخلص."
             }
 
         if text == "/files":
