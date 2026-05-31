@@ -450,6 +450,7 @@ async def get_rag_response(user_id, text, history_table, user_column, user_name=
     if is_greeting:
         similar_docs = []
         memory_context = ""
+        summary_context = ""
         print(f"[SMART] Skipped RAG for greeting: '{text_lower}'", flush=True)
     else:
         # Use fewer docs for short questions, more for complex ones
