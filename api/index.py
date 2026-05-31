@@ -365,6 +365,35 @@ async def send_whatsapp(to_phone, text):
                 await asyncio.sleep(1)
 
 
+async def broadcast_update():
+    """Broadcast an update message to all Telegram and WhatsApp users."""
+    message = "تم تحديث البوت بميزات جديدة وأصبح أسرع وأذكى! 🚀\nنعتذر إذا قمت بإرسال رسالة في آخر 5 دقائق ولم يتم الرد عليها بسبب التحديث، يمكنك إعادة إرسالها الآن. 😊"
+    
+    # 1. Telegram Users
+    try:
+        tg_users = await db(lambda: supabase.table("bot_users").select("chat_id").execute())
+        if tg_users.data:
+            print(f"[BROADCAST] Sending to {len(tg_users.data)} Telegram users...", flush=True)
+            for u in tg_users.data:
+                await send_telegram(u["chat_id"], message)
+                await asyncio.sleep(0.05)
+    except Exception as e:
+        print(f"[BROADCAST] Telegram error: {e}", flush=True)
+        
+    # 2. WhatsApp Users
+    try:
+        wa_users = await db(lambda: supabase.table("whatsapp_users").select("phone_number").execute())
+        if wa_users.data:
+            print(f"[BROADCAST] Sending to {len(wa_users.data)} WhatsApp users...", flush=True)
+            for u in wa_users.data:
+                await send_whatsapp(u["phone_number"], message)
+                await asyncio.sleep(0.05)
+    except Exception as e:
+        print(f"[BROADCAST] WhatsApp error: {e}", flush=True)
+    
+    print("[BROADCAST] Finished sending update messages.", flush=True)
+
+
 async def summarize_conversation_task(user_id, platform, history_table, user_column):
     """Background task to summarize conversation every 10 user messages using Ollama."""
     try:
@@ -953,6 +982,15 @@ async def process_telegram_inline(chat_id, text, msg_info):
                 "method": "sendMessage",
                 "chat_id": chat_id,
                 "text": "⏳ جاري بدء عملية المزامنة... سيتم إبلاغك عند الانتهاء."
+            }
+            
+        if text == "/update":
+            # Start background broadcast update
+            asyncio.create_task(broadcast_update())
+            return {
+                "method": "sendMessage",
+                "chat_id": chat_id,
+                "text": "📢 جاري إرسال رسالة التحديث لجميع الطلاب على تيليجرام وواتساب..."
             }
 
         if text == "/files":
