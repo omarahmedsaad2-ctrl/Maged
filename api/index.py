@@ -366,6 +366,79 @@ async def send_whatsapp(to_phone, text):
                 await asyncio.sleep(1)
 
 
+async def summarize_conversation_task(user_id, platform, history_table, user_column):
+    """Background task to summarize conversation every 10 user messages using Ollama."""
+    try:
+        # Fetch last 15 messages
+        history_response = await db(lambda: supabase.table(history_table).select("role, content").eq(user_column, user_id).order("created_at", desc=True).limit(15).execute())
+        if not history_response.data or len(history_response.data) < 5:
+            return # Too short to summarize
+        
+        messages = list(reversed(history_response.data))
+        convo_text = ""
+        for m in messages:
+            role_label = "Student" if m["role"] == "user" else "Bot"
+            convo_text += f"{role_label}: {m['content']}\n"
+            
+        prompt = f"""You are an expert educational AI summarizer.
+Summarize the following student-teacher conversation in EXACTLY 3 bullet points.
+Focus exclusively on:
+1. Student's English level and learning progress.
+2. Grammar/Vocabulary topics covered.
+3. Student's weak points or mistakes.
+
+Conversation:
+{convo_text}
+
+Respond ONLY with the 3 bullet points, no intro or outro."""
+
+        # Call Ollama
+        global current_ollama_key_index
+        summary_text = None
+        for attempt in range(max(1, len(OLLAMA_KEYS))):
+            current_key = OLLAMA_KEYS[current_ollama_key_index] if OLLAMA_KEYS else ""
+            try:
+                response = await _client.post(
+                    "https://ollama.com/api/chat",
+                    json={
+                        "model": "gpt-oss:120b",
+                        "messages": [{"role": "user", "content": prompt}],
+                        "stream": False
+                    },
+                    headers={"Authorization": f"Bearer {current_key}"},
+                    timeout=30.0
+                )
+                if response.status_code == 200:
+                    summary_text = response.json().get("message", {}).get("content", "").strip()
+                    break
+                else:
+                    if OLLAMA_KEYS: current_ollama_key_index = (current_ollama_key_index + 1) % len(OLLAMA_KEYS)
+            except Exception as e:
+                if OLLAMA_KEYS: current_ollama_key_index = (current_ollama_key_index + 1) % len(OLLAMA_KEYS)
+                
+        if not summary_text or len(summary_text) < 20:
+            print(f"[SUMMARY] Failed to generate summary for {user_id}", flush=True)
+            return
+            
+        print(f"[SUMMARY] Generated for {user_id}:\n{summary_text}", flush=True)
+        
+        # Embed the summary
+        summary_embedding = await get_embedding(summary_text)
+        
+        # Save to DB
+        await db(lambda: supabase.table("chat_summaries").insert({
+            "platform": platform,
+            "user_id": str(user_id),
+            "summary_text": summary_text,
+            "embedding": summary_embedding,
+            "messages_covered": len(messages)
+        }).execute())
+        print(f"[SUMMARY] Saved summary to DB for {user_id}", flush=True)
+        
+    except Exception as e:
+        print(f"[SUMMARY ERROR] {e}", flush=True)
+
+
 # --- RAG Response ---
 GREETINGS = {"hi", "hello", "hey", "هلا", "اهلا", "مرحبا", "هاي", "السلام عليكم", "ازيك", "ازيكم", "صباح الخير", "مساء الخير", "يا مستر", "مستر"}
 
@@ -409,6 +482,26 @@ async def get_rag_response(user_id, text, history_table, user_column, user_name=
         except Exception as e:
             print(f"[MEMORY RAG] Error searching chat history: {e}", flush=True)
             memory_context = ""
+
+        # --- Deep Memory RAG: search student's chat summaries ---
+        summary_context = ""
+        try:
+            platform = "telegram" if history_table == "chat_history" else "whatsapp"
+            summary_results = await db(lambda: supabase.rpc("match_user_summaries", {
+                "query_embedding": query_emb,
+                "target_user_id": str(user_id),
+                "target_platform": platform,
+                "match_threshold": 0.3,
+                "match_count": 2
+            }).execute())
+            if summary_results.data:
+                summary_lines = []
+                for s in summary_results.data:
+                    summary_lines.append(f"- {s['summary_text']}")
+                summary_context = "\n".join(summary_lines)
+                print(f"[SUMMARY RAG] Found {len(summary_results.data)} relevant past summaries for {user_id}", flush=True)
+        except Exception as e:
+            print(f"[SUMMARY RAG] Error searching chat summaries: {e}", flush=True)
 
     def get_source(d):
         meta = d.get('metadata', {})
@@ -467,15 +560,14 @@ CURRENT STUDENT PROFILE:
 
     # --- Build Memory Section ---
     memory_section = ""
-    if memory_context:
-        memory_section = f"""
-
-LONG-TERM MEMORY (Past conversations with THIS student retrieved by relevance):
-These are REAL past messages between you and this student from older conversations. Use them to provide personalized responses:
-{memory_context}
-📌 Reference these memories naturally when relevant. Example: 'زي ما اتكلمنا قبل كده عن...'
-📌 Do NOT list or dump memory contents. Weave them into your response naturally.
-"""
+    if memory_context or summary_context:
+        memory_section = "\n\nLONG-TERM MEMORY (Past conversations with THIS student retrieved by relevance):\n"
+        if summary_context:
+            memory_section += f"📌 STUDENT LEARNING SUMMARIES (High Priority):\nThese are AI-generated summaries of your past sessions with this student:\n{summary_context}\n\n"
+        if memory_context:
+            memory_section += f"📌 SPECIFIC PAST MESSAGES:\nThese are verbatim past messages:\n{memory_context}\n\n"
+        memory_section += "📌 Reference these memories naturally when relevant. Example: 'زي ما اتكلمنا قبل كده عن...'\n"
+        memory_section += "📌 Do NOT list or dump memory contents. Weave them into your response naturally."
 
     system_prompt = f"""{opus_content}
 
@@ -658,6 +750,22 @@ COURSE MATERIALS:
         await db(lambda: supabase.table(history_table).insert(insert_data).execute())
     except Exception as e:
         print("Failed to save user history:", e, flush=True)
+
+    # --- Trigger background summarization if needed ---
+    try:
+        async def trigger_summary_if_needed():
+            try:
+                count_res = await db(lambda: supabase.table(history_table).select('*', count='exact').eq(user_column, user_id).eq("role", "user").execute())
+                count = count_res.count if hasattr(count_res, 'count') and count_res.count else 0
+                if count > 0 and count % 10 == 0:
+                    platform = "telegram" if history_table == "chat_history" else "whatsapp"
+                    asyncio.create_task(summarize_conversation_task(user_id, platform, history_table, user_column))
+            except Exception as ex:
+                pass
+        asyncio.create_task(trigger_summary_if_needed())
+    except Exception as e:
+        print(f"Summary trigger error: {e}", flush=True)
+
 
     global current_ollama_key_index
     answer = "Sorry, I couldn't generate an answer."
