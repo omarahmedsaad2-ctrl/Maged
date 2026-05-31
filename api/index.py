@@ -12,6 +12,14 @@ import sys
 import asyncio
 import httpx
 import requests  # kept only for supabase internal use
+
+def clean_name(text):
+    """Extract actual name from phrases like 'اسمي عمر' or 'my name is omar'"""
+    t = text.strip()
+    t = re.sub(r'^(انا\s+اسمي|أنا\s+اسمي|اسمي|أسمى|اسمى|الاسم|انا|أنا)\s+', '', t)
+    t = re.sub(r'^(i am|i\'m|my name is|name is|im)\s+', '', t, flags=re.IGNORECASE)
+    return t.strip()
+
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, PlainTextResponse
 from supabase import create_client, Client
@@ -865,7 +873,7 @@ async def process_telegram_inline(chat_id, text, msg_info):
 
         # --- Telegram Name Collection Flow ---
         if tg_awaiting_name and not tg_real_name:
-            submitted_name = text.strip()
+            submitted_name = clean_name(text)
             if 2 <= len(submitted_name) <= 50 and not submitted_name.startswith("/"):
                 try:
                     await db(lambda n=submitted_name, c=chat_id: supabase.table("bot_users").update(
@@ -1016,7 +1024,7 @@ async def process_whatsapp_message(data):
                     # --- Name collection flow ---
                     if is_awaiting_name and not user_real_name:
                         # Student is replying with their name
-                        submitted_name = text.strip()
+                        submitted_name = clean_name(text)
                         # Basic validation: name should be 2-50 chars, mostly letters
                         if 2 <= len(submitted_name) <= 50 and not submitted_name.startswith("/"):
                             try:
