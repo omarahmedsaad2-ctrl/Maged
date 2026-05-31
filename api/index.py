@@ -244,10 +244,25 @@ async def run_sync_logic(chat_id=None):
 
 
 # --- Send Functions (all async with retry + hard timeouts) ---
+class DummyResponse:
+    def __init__(self, status_code, text):
+        self.status_code = status_code
+        self.text = text
+
 async def _tg_post(url, json_data, timeout=15):
-    """POST to Telegram API using a fresh client to prevent deadlocks on Hugging Face."""
-    async with httpx.AsyncClient(verify=False) as client:
-        return await client.post(url, json=json_data, timeout=timeout)
+    """POST to Telegram API using urllib.request to bypass async network hangs on HuggingFace."""
+    def _do_post():
+        import urllib.request, json, urllib.error
+        data = json.dumps(json_data).encode('utf-8')
+        req = urllib.request.Request(url, data=data, headers={'Content-Type': 'application/json'})
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                return DummyResponse(resp.getcode(), resp.read().decode('utf-8'))
+        except urllib.error.HTTPError as e:
+            return DummyResponse(e.code, e.read().decode('utf-8'))
+        except Exception as e:
+            return DummyResponse(500, str(e))
+    return await asyncio.to_thread(_do_post)
 
 
 async def send_telegram(chat_id, text):
