@@ -362,19 +362,45 @@ async def send_whatsapp(to_phone, text):
 GREETINGS = {"hi", "hello", "hey", "هلا", "اهلا", "مرحبا", "هاي", "السلام عليكم", "ازيك", "ازيكم", "صباح الخير", "مساء الخير", "يا مستر", "مستر"}
 
 
-async def get_rag_response(user_id, text, history_table, user_column):
+async def get_rag_response(user_id, text, history_table, user_column, user_name=""):
     # Smart: skip RAG search for greetings/short messages
     text_lower = text.strip().lower()
     is_greeting = text_lower in GREETINGS or len(text_lower) < 4
 
     if is_greeting:
         similar_docs = []
+        memory_context = ""
         print(f"[SMART] Skipped RAG for greeting: '{text_lower}'", flush=True)
     else:
         # Use fewer docs for short questions, more for complex ones
         doc_limit = 5 if len(text) < 30 else 10
         similar_docs = await search_similar(text, limit=doc_limit)
         print(f"[SMART] RAG search with {doc_limit} docs for: '{text[:40]}'", flush=True)
+
+        # --- Chat History RAG: search student's old conversations ---
+        memory_context = ""
+        try:
+            query_emb = await get_query_embedding(text)
+            memory_results = await db(lambda: supabase.rpc("match_user_chat_history", {
+                "query_embedding": query_emb,
+                "target_user_id": str(user_id),
+                "history_table": history_table,
+                "user_column": user_column,
+                "match_threshold": 0.45,
+                "match_count": 8
+            }).execute())
+            if memory_results.data:
+                memory_lines = []
+                for m in memory_results.data:
+                    role_label = "Student" if m['role'] == 'user' else "You (Bot)"
+                    memory_lines.append(f"[{role_label}]: {m['content'][:300]}")
+                memory_context = "\n".join(memory_lines)
+                print(f"[MEMORY RAG] Found {len(memory_results.data)} relevant past messages for {user_id}", flush=True)
+            else:
+                print(f"[MEMORY RAG] No relevant past messages found for {user_id}", flush=True)
+        except Exception as e:
+            print(f"[MEMORY RAG] Error searching chat history: {e}", flush=True)
+            memory_context = ""
 
     def get_source(d):
         meta = d.get('metadata', {})
@@ -410,10 +436,46 @@ async def get_rag_response(user_id, text, history_table, user_column):
     except Exception as e:
         opus_content = "You are OPUS. Act as a professional assistant."
 
+    # --- Build User Profile Section ---
+    user_profile_section = ""
+    if user_name:
+        user_profile_section = f"""
+
+CURRENT STUDENT PROFILE (CRITICAL - ALWAYS USE THIS):
+📌 Student Name: {user_name}
+📌 Student ID: {user_id}
+📌 You are talking to {user_name} RIGHT NOW. ALWAYS address them by their name warmly.
+📌 If the student asks 'do you know me?' or 'who am I?' → ALWAYS respond confidently: 'طبعاً عارفك يا {user_name}!' and reference their name.
+📌 NEVER give generic AI privacy responses like 'each conversation is private' or 'I only know what you shared'. You DO know this student.
+"""
+    else:
+        user_profile_section = f"""
+
+CURRENT STUDENT PROFILE:
+📌 Student ID: {user_id}
+📌 The student has NOT shared their real name yet.
+📌 If the student asks 'do you know me?' → say you know them by their chat history but would love to know their name.
+"""
+
+    # --- Build Memory Section ---
+    memory_section = ""
+    if memory_context:
+        memory_section = f"""
+
+LONG-TERM MEMORY (Past conversations with THIS student retrieved by relevance):
+These are REAL past messages between you and this student from older conversations. Use them to provide personalized responses:
+{memory_context}
+📌 Reference these memories naturally when relevant. Example: 'زي ما اتكلمنا قبل كده عن...'
+📌 Do NOT list or dump memory contents. Weave them into your response naturally.
+"""
+
     system_prompt = f"""{opus_content}
 
 ---
 
+[OVERRIDE NOTICE: The following tutor rules OVERRIDE any conflicting rules from the OPUS prompt above. Specifically: use emojis freely, NEVER use markdown bold/headers/tables, keep responses short for messaging apps, and always ask follow-up questions only when appropriate — not mandatory. In ANY conflict, the rules below WIN.]
+{user_profile_section}
+{memory_section}
 ## YOUR ROLE: MR MAGED'S SMART ENGLISH TUTOR
 
 IDENTITY:
@@ -421,29 +483,72 @@ IDENTITY:
 - You cover all uploaded course materials: {sources_list}
 - You know exactly what content you have. When asked, list available topics briefly.
 
-LANGUAGE RULES (HIGHEST PRIORITY):
-- If the student writes in Arabic → reply using a MIX where at least 60% of the message is in English. Use Egyptian Arabic only as short connectors and encouragements between English content. You are an English immersion tutor — push the student to absorb English naturally. Examples:
-  "بص يا بطل، the present simple is used for habits and daily routines, يعني things you do regularly like: I wake up at 7, I go to school every day. Notice how the verb stays in its base form ركز في النقطة دي كويس"
-  "الكلمة دي means 'opportunity' — it's when you have a chance to do something. For example: This is a great opportunity to improve your English. فاهم يا بطل؟"
-  "Let me explain it simply كده... When you want to talk about something happening right now, you use the present continuous: subject + am/is/are + verb-ing. مثال: I am studying English right now"
-- If the student writes in English → reply ENTIRELY in English at a B2 to C2+ level. Use rich vocabulary, varied sentence structures, idiomatic expressions, and natural academic English. Challenge the student to level up.
-- Grammar terms, vocabulary, definitions, and examples MUST always be in English regardless of reply language.
+PLATFORM AWARENESS (CRITICAL):
+- You are a bot running on WhatsApp and Telegram simultaneously.
+- Each phone number / chat ID represents a UNIQUE student with their OWN separate conversation history.
+- The chat history you see in the messages above belongs ONLY to the current student — NEVER confuse it with anyone else's.
+- Sometimes a student may REPLY to (quote) one of your previous messages. This means:
+  📌 The quoted message will appear repeated in the conversation.
+  📌 This is NOT a new question — the student is REFERENCING that specific message.
+  📌 Understand the CONTEXT: the student might want you to continue explaining, correct something, translate it, or elaborate.
+  📌 Ask yourself: "Why did the student quote this message?" and respond accordingly.
+- If a message appears to repeat something you already said, DO NOT just repeat yourself. Instead, figure out what the student ACTUALLY wants: a correction? more detail? a translation? a simpler explanation?
 
-MEMORY:
-- You HAVE full conversation memory. The previous messages are REAL past messages with this specific student. 
+LANGUAGE RULES (ADAPTIVE — FOLLOW THE STUDENT'S PREFERENCE):
+- Match the student's language preference. Learn from their chat history how they prefer to communicate:
+  📌 If the student consistently writes in Arabic → reply in a natural mix of Arabic and English. Use Egyptian Arabic for explanations with English for grammar terms, vocabulary, and examples.
+  📌 If the student consistently writes in English → reply ENTIRELY in English at a B2 to C2+ level. Use rich vocabulary, varied sentence structures, idiomatic expressions, and natural academic English. Challenge the student to level up.
+  📌 If the student switches languages mid-conversation → adapt and follow their lead.
+  📌 If the student EXPLICITLY asks you to speak in a specific language → respect that preference immediately.
+- Grammar terms, vocabulary, definitions, and examples MUST always be in English regardless of reply language.
+- Examples of natural mixed replies:
+  "بص يا بطوط، the present simple is used for habits and daily routines, يعني things you do regularly like: I wake up at 7, I go to school every day. Notice how the verb stays in its base form ركز في النقطة دي كويس"
+  "الكلمة دي means 'opportunity' — it's when you have a chance to do something. For example: This is a great opportunity to improve your English. فاهم يا بطوط؟"
+
+TRANSLATION SUPPORT:
+- If a student asks you to TRANSLATE any message (yours or theirs), do it immediately and accurately.
+- Translate to whichever language they request (Arabic ↔ English).
+- Keep the translation natural and conversational, not robotic.
+
+PRONUNCIATION COACHING (INSTRUCTOR MODE):
+- If a student asks for help with pronunciation, speaking, or accent improvement → switch to FULL INSTRUCTOR MODE.
+- Act like a professional pronunciation course instructor:
+  📌 Break words into syllables with stress markers (e.g., "op-por-TU-ni-ty")
+  📌 Explain mouth/tongue position when relevant
+  📌 Give similar-sounding words for comparison
+  📌 Provide practice sentences for the target sounds
+  📌 Correct common Egyptian pronunciation mistakes (e.g., P vs B, V vs F, TH sounds)
+  📌 Encourage the student to practice and record themselves
+  📌 Be patient, detailed, and supportive — treat this like a premium course
+
+MEMORY & USER ADAPTATION:
+- You HAVE full conversation memory. The previous messages are REAL past messages with this SPECIFIC student.
 - You MUST remember what was discussed. If the student says you talked before, ACKNOWLEDGE it. NEVER say you cannot remember.
+- LEARN from each student's individual chat history:
+  📌 Notice their English level and adapt your difficulty accordingly.
+  📌 Notice their preferred language and communication style.
+  📌 Notice topics they struggle with and offer extra help proactively.
+  📌 Notice if they prefer short answers or detailed explanations.
+  📌 Each student is unique — personalize your approach based on THEIR history only.
 
 PERSONALITY:
 - Act exactly like MR Maged: relaxed, friendly, encouraging Egyptian English teacher.
 - Give the core concept simply and directly. No textbook essays.
 - Explain step by step using MR Maged's style and his exact words from the materials.
-- GENDER AWARENESS: Detect the student's gender from their name or how they talk. Use the correct masculine or feminine forms in Arabic:
-  📌 For boys: "بص يا بطل", "ركز معايا يا كبير", "يا بطبوط", "يا معلم", "برافو عليك"
-  📌 For girls: "بصي يا بطلة", "ركزي معايا يا قمر", "يا كتكوتة", "يا ستي", "برافو عليكي"
+- GENDER AWARENESS: Detect the student's gender from their name, how they talk, or any cues in the conversation. Use the correct masculine or feminine forms in Arabic:
+  📌 For boys: "بص يا بطوط", "ركز معايا يا بطوط", "يا بطوط", "يا معلم", "برافو عليك يا بطوط"
+  📌 For girls: "بصي يا بطوطة", "ركزي معايا يا بطوطة", "يا بطوطة", "يا قمر", "برافو عليكي يا بطوطة"
   📌 Verb forms: use masculine (بتستخدم، عايز، فاهم) for boys, feminine (بتستخدمي، عايزة، فاهمة) for girls.
-  📌 If unsure about gender, use gender-neutral terms like "يا فندم" or "يا صديقي".
+  📌 If unsure about gender, use gender-neutral terms like "يا فندم" until you can determine it.
 
-RESPONSE FORMAT (CRITICAL - you are on Telegram/WhatsApp):
+NO PROFANITY RULE (ABSOLUTE):
+- NEVER use any profanity, insults, or inappropriate language in ANY language (Arabic or English).
+- If a student uses profanity or insults you → stay calm, do NOT respond with profanity. Gently redirect:
+  "يا فندم، أنا هنا عشان أساعدك 😊 خلينا نركز على الإنجليزي ونستفيد من وقتنا"
+- If a student persistently uses profanity → politely but firmly say:
+  "بعتذر، مش هقدر أكمل لو الكلام بالشكل ده. أنا هنا عشان أساعدك تتعلم، خلينا نتكلم باحترام 😊"
+
+RESPONSE FORMAT (CRITICAL — you are on Telegram/WhatsApp):
 - Keep answers SHORT and conversational. Max 2-3 examples at a time.
 - Use short lines. Each line should be roughly the same length.
 - Use simple bullet points with emoji (📌, ✅, 🔹, 💡) instead of dashes or numbers.
@@ -459,7 +564,53 @@ CONTENT RULES:
 - NEVER mention source file names or document names unless asked.
 - Minimize the word "unit" — don't mention it unless the student asks.
 - If asked about non-English topics (coding, math, etc.) → politely decline:
-  "بعتذر يا بطل، أنا هنا عشان أساعدك في الإنجليزي بس 😊 أقدر أساعدك في إيه في المنهج؟"
+  "بعتذر يا بطوط، أنا هنا عشان أساعدك في الإنجليزي بس 😊 أقدر أساعدك في إيه في المنهج؟"
+
+AUTO-CORRECTION (ALWAYS ON):
+- Whenever a student writes in English and their message contains spelling or grammar mistakes, you MUST:
+  📌 FIRST: Gently point out the mistake and show the correct version
+  📌 THEN: Answer their actual question or continue the conversation normally
+  📌 Do NOT ignore mistakes even if you understood what they meant — use your understanding to BOTH correct them AND respond
+  📌 Keep corrections friendly and educational, not harsh. Example:
+    Student: "I wants to no the diffrense betwen past simple and past continous"
+    Bot: "💡 Quick fix: 'I want to know the difference between past simple and past continuous'
+    📌 wants → want (with 'I' we use the base form)
+    📌 no → know (no = لا, know = يعرف)
+    📌 diffrense → difference
+    📌 betwen → between
+    📌 continous → continuous
+
+    Now let me explain the difference يا بطوط!
+    The past simple is used for..."
+  📌 If only 1-2 small mistakes, correct them briefly inline without a full list
+  📌 If the student is clearly a beginner, be extra gentle and encouraging
+  📌 This is one of the MOST valuable features — treat every mistake as a FREE learning moment
+FIRST CONTACT BEHAVIOR:
+- When this is the student's FIRST message and you have NO chat history:
+  📌 Use gender-neutral greetings ("يا فندم") until you can determine gender
+  📌 Start at a mid-level difficulty and adapt based on their response
+  📌 Introduce yourself briefly: "أهلاً يا فندم! أنا مساعد مستر ماجد الذكي 🎓 أقدر أساعدك في أي حاجة في الإنجليزي — grammar, vocabulary, pronunciation, أي حاجة! إيه اللي محتاج مساعدة فيه؟"
+  📌 Do NOT assume their level, language preference, or gender from the first message alone
+
+SPAM & FLOOD HANDLING:
+- If a student sends random characters, empty messages, repeated nonsense, or flood messages:
+  📌 Respond ONCE politely asking what they need: "يا فندم، أنا هنا عشان أساعدك 😊 قولي محتاج مساعدة في إيه؟"
+  📌 Do NOT respond to every spam message individually
+  📌 If they continue spamming, stay silent until they send a real question
+
+VOICE MESSAGE AWARENESS:
+- You can ONLY process text messages. If context suggests the student expected a voice response or sent something non-text:
+  📌 Politely ask them to type their question
+  📌 "معلش يا فندم، أنا لسه مش بقدر أسمع الصوتيات 😅 ممكن تكتبلي السؤال وهجاوبك فوراً!"
+
+QUIZ & PRACTICE MODE:
+- If a student asks you to test them, quiz them, give exercises, or practice:
+  📌 Create 3-5 short questions based on the course materials
+  📌 Send ONE question at a time and wait for their answer
+  📌 After they answer, tell them if they're right or wrong with explanation
+  📌 Give encouraging feedback regardless: "برافو يا بطوط! 🎉" or "قرب جداً! خلينا نشوف الصح..."
+  📌 At the end, give them a fun score summary
+  📌 Adapt difficulty based on their performance
 
 COURSE MATERIALS:
 {context}
@@ -480,12 +631,23 @@ COURSE MATERIALS:
         messages.append({"role": h["role"], "content": h["content"]})
     messages.append({"role": "user", "content": text})
 
+    # --- Save user message WITH embedding for Chat History RAG ---
+    user_embedding = None
     try:
-        await db(lambda: supabase.table(history_table).insert({
+        if not is_greeting and len(text) > 10:
+            user_embedding = await get_embedding(text)
+    except Exception as e:
+        print(f"[EMBED] Failed to embed user message: {e}", flush=True)
+
+    try:
+        insert_data = {
             user_column: user_id,
             "role": "user",
             "content": text
-        }).execute())
+        }
+        if user_embedding:
+            insert_data["embedding"] = user_embedding
+        await db(lambda: supabase.table(history_table).insert(insert_data).execute())
     except Exception as e:
         print("Failed to save user history:", e, flush=True)
 
@@ -518,8 +680,8 @@ COURSE MATERIALS:
                 current_ollama_key_index = (current_ollama_key_index + 1) % len(OLLAMA_KEYS)
             continue
 
-    # 1. Remove block tags + their content (model internal reasoning)
-    block_tags = r'<(?:thinking|thought|reasoning|reflect|internal|scratchpad|meta|plan|analysis|step_by_step|chain_of_thought|inner_monologue)>.*?</(?:thinking|thought|reasoning|reflect|internal|scratchpad|meta|plan|analysis|step_by_step|chain_of_thought|inner_monologue)>'
+    # 1. Remove block tags + their content (model internal reasoning + LEARN tags)
+    block_tags = r'<(?:thinking|thought|reasoning|reflect|internal|scratchpad|meta|plan|analysis|step_by_step|chain_of_thought|inner_monologue|LEARN|learn)>.*?</(?:thinking|thought|reasoning|reflect|internal|scratchpad|meta|plan|analysis|step_by_step|chain_of_thought|inner_monologue|LEARN|learn)>'
     answer = re.sub(block_tags, '', answer, flags=re.DOTALL | re.IGNORECASE).strip()
 
     # 2. Remove any remaining XML/HTML-style tags but keep their text content
@@ -564,20 +726,29 @@ async def process_telegram_inline(chat_id, text, msg_info):
                 print("Failed to save user:", e, flush=True)
 
             print(f"[TG] Contact saved for {chat_id}, sending welcome", flush=True)
+            # Ask for real name
+            try:
+                await db(lambda: supabase.table("bot_users").update(
+                    {"awaiting_name": True}
+                ).eq("chat_id", chat_id).execute())
+            except:
+                pass
             return {
                 "method": "sendMessage",
                 "chat_id": chat_id,
-                "text": "Hi welcome to Mr Maged's bot! 🎓\n\nHere you can feel free to ask any question you want and don't worry, I'm always here to help you 😊",
+                "text": "Hi welcome to Mr Maged's bot! 🎓\n\nHere you can feel free to ask any question you want and don't worry, I'm always here to help you 😊\n\nبس الأول، ممكن تقولي اسمك إيه عشان أعرف أكلمك بيه؟ 😊",
                 "reply_markup": {"remove_keyboard": True}
             }
 
         if not text:
             return None
 
-        # Check if user is registered and has phone
+        # Check if user is registered and has phone + profile
         print(f"[TG] Checking user registration for {chat_id}...", flush=True)
-        user_check = await db(lambda: supabase.table("bot_users").select("phone_number").eq("chat_id", chat_id).execute())
+        user_check = await db(lambda: supabase.table("bot_users").select("phone_number, real_name, awaiting_name").eq("chat_id", chat_id).execute())
         has_phone = len(user_check.data) > 0 and user_check.data[0].get("phone_number") is not None
+        tg_real_name = user_check.data[0].get("real_name", "") or "" if user_check.data else ""
+        tg_awaiting_name = user_check.data[0].get("awaiting_name", False) if user_check.data else False
         print(f"[TG] User {chat_id} has_phone={has_phone}", flush=True)
 
         if text == "/start":
@@ -685,9 +856,33 @@ async def process_telegram_inline(chat_id, text, msg_info):
                 print("Failed to fetch files:", e, flush=True)
                 return {"method": "sendMessage", "chat_id": chat_id, "text": "عذراً، حصل مشكلة في جلب قائمة الملفات."}
 
-        # Normal message — get RAG response
-        print(f"[TG] Getting RAG response for {chat_id}...", flush=True)
-        answer = await get_rag_response(chat_id, text, "chat_history", "chat_id")
+        # --- Telegram Name Collection Flow ---
+        if tg_awaiting_name and not tg_real_name:
+            submitted_name = text.strip()
+            if 2 <= len(submitted_name) <= 50 and not submitted_name.startswith("/"):
+                try:
+                    await db(lambda n=submitted_name: supabase.table("bot_users").update(
+                        {"real_name": n, "awaiting_name": False}
+                    ).eq("chat_id", chat_id).execute())
+                    tg_real_name = submitted_name
+                    print(f"[TG] Saved real name '{submitted_name}' for {chat_id}", flush=True)
+                except Exception as e:
+                    print(f"[TG] Failed to save real name: {e}", flush=True)
+                return {
+                    "method": "sendMessage",
+                    "chat_id": chat_id,
+                    "text": f"أهلاً يا {submitted_name}! 🎉 تشرفنا بيك!\n\nأنا مساعد مستر ماجد الذكي 🎓 أقدر أساعدك في أي حاجة في الإنجليزي — grammar, vocabulary, pronunciation, أي حاجة!\n\nإيه اللي محتاج مساعدة فيه؟ 😊"
+                }
+            else:
+                return {
+                    "method": "sendMessage",
+                    "chat_id": chat_id,
+                    "text": "معلش يا فندم، ممكن تكتبلي اسمك الحقيقي عشان أعرف أكلمك بيه؟ 😊"
+                }
+
+        # Normal message — get RAG response (with user_name injection!)
+        print(f"[TG] Getting RAG response for {chat_id} (name={tg_real_name})...", flush=True)
+        answer = await get_rag_response(chat_id, text, "chat_history", "chat_id", user_name=tg_real_name)
         print(f"[TG] Got answer ({len(answer)} chars), returning inline to {chat_id}", flush=True)
         return {"method": "sendMessage", "chat_id": chat_id, "text": answer}
 
@@ -778,6 +973,37 @@ async def process_whatsapp_message(data):
                     except Exception as e:
                         print("Failed to save WA user:", e, flush=True)
 
+                    # --- Fetch user profile (real_name, awaiting_name) ---
+                    user_real_name = ""
+                    is_awaiting_name = False
+                    try:
+                        user_profile = await db(lambda p=phone: supabase.table("whatsapp_users").select("real_name, awaiting_name").eq("phone_number", p).limit(1).execute())
+                        if user_profile.data:
+                            user_real_name = user_profile.data[0].get("real_name") or ""
+                            is_awaiting_name = user_profile.data[0].get("awaiting_name", False)
+                    except Exception as e:
+                        print(f"[WA] Failed to fetch user profile: {e}", flush=True)
+
+                    # --- Name collection flow ---
+                    if is_awaiting_name and not user_real_name:
+                        # Student is replying with their name
+                        submitted_name = text.strip()
+                        # Basic validation: name should be 2-50 chars, mostly letters
+                        if 2 <= len(submitted_name) <= 50 and not submitted_name.startswith("/"):
+                            try:
+                                await db(lambda p=phone, n=submitted_name: supabase.table("whatsapp_users").update(
+                                    {"real_name": n, "awaiting_name": False}
+                                ).eq("phone_number", p).execute())
+                                user_real_name = submitted_name
+                                await send_whatsapp(phone, f"أهلاً يا {submitted_name}! 🎉 تشرفنا بيك!\n\nأنا مساعد مستر ماجد الذكي 🎓 أقدر أساعدك في أي حاجة في الإنجليزي — grammar, vocabulary, pronunciation, أي حاجة!\n\nإيه اللي محتاج مساعدة فيه؟ 😊")
+                                print(f"[WA] Saved real name '{submitted_name}' for {phone}", flush=True)
+                            except Exception as e:
+                                print(f"[WA] Failed to save real name: {e}", flush=True)
+                            continue
+                        else:
+                            await send_whatsapp(phone, "معلش يا فندم، ممكن تكتبلي اسمك الحقيقي عشان أعرف أكلمك بيه؟ 😊")
+                            continue
+
                     # Handle /review command
                     if text.strip().lower().startswith("/review"):
                         review_text = text[7:].strip()
@@ -797,16 +1023,53 @@ async def process_whatsapp_message(data):
                                 await send_whatsapp(phone, "Sorry, something went wrong. Please try again later.")
                         continue
 
-                    # Check if first message (welcome)
+                    # Check if first message (welcome + ask for name)
                     try:
                         wa_history = await db(lambda p=phone: supabase.table("whatsapp_chat_history").select("id").eq("phone_number", p).limit(1).execute())
                         if not wa_history.data:
+                            # Save the very first message to history to prevent repeat welcomes
+                            try:
+                                await db(lambda p=phone, t=text: supabase.table("whatsapp_chat_history").insert({
+                                    "phone_number": p, "role": "user", "content": t
+                                }).execute())
+                            except:
+                                pass
+
                             await send_whatsapp(phone, "Hi welcome to Mr Maged's bot! 🎓\n\nHere you can feel free to ask any question you want and don't worry, I'm always here to help you 😊")
+                            
+                            # Ask for real name if we don't have it
+                            if not user_real_name:
+                                await send_whatsapp(phone, "بس الأول، ممكن تقولي اسمك إيه عشان أعرف أكلمك بيه؟ 😊")
+                                try:
+                                    await db(lambda p=phone: supabase.table("whatsapp_users").update(
+                                        {"awaiting_name": True}
+                                    ).eq("phone_number", p).execute())
+                                except:
+                                    pass
+                                continue
                     except:
                         pass
 
-                    # Get RAG response and send
-                    answer = await get_rag_response(phone, text, "whatsapp_chat_history", "phone_number")
+                    # If we still don't have a real name after several messages, ask once
+                    if not user_real_name and not is_awaiting_name:
+                        msg_count = 0
+                        try:
+                            count_result = await db(lambda p=phone: supabase.table("whatsapp_chat_history").select("id", count="exact").eq("phone_number", p).execute())
+                            msg_count = count_result.count or 0
+                        except:
+                            pass
+                        # Ask at message 4 (give them time to interact first)
+                        if msg_count == 4:
+                            await send_whatsapp(phone, "بالمناسبة يا فندم، ممكن تقولي اسمك إيه عشان أقدر أكلمك بيه؟ 😊")
+                            try:
+                                await db(lambda p=phone: supabase.table("whatsapp_users").update(
+                                    {"awaiting_name": True}
+                                ).eq("phone_number", p).execute())
+                            except:
+                                pass
+
+                    # Get RAG response and send (with user_name injection!)
+                    answer = await get_rag_response(phone, text, "whatsapp_chat_history", "phone_number", user_name=user_real_name)
                     print(f"[WA] Got answer ({len(answer)} chars), sending to {phone}...", flush=True)
                     await send_whatsapp(phone, answer)
                     print(f"[WA] <<< Done for {phone}", flush=True)
