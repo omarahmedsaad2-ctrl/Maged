@@ -716,23 +716,17 @@ async def process_telegram_inline(chat_id, text, msg_info):
             username = msg_info.get("from", {}).get("username", "")
 
             try:
-                await db(lambda: supabase.table("bot_users").upsert({
-                    "chat_id": chat_id,
-                    "phone_number": phone,
-                    "name": first_name,
-                    "username": username
+                await db(lambda c=chat_id, p=phone, fn=first_name, un=username: supabase.table("bot_users").upsert({
+                    "chat_id": c,
+                    "phone_number": p,
+                    "name": fn,
+                    "username": un,
+                    "awaiting_name": True
                 }).execute())
             except Exception as e:
                 print("Failed to save user:", e, flush=True)
 
             print(f"[TG] Contact saved for {chat_id}, sending welcome", flush=True)
-            # Ask for real name
-            try:
-                await db(lambda: supabase.table("bot_users").update(
-                    {"awaiting_name": True}
-                ).eq("chat_id", chat_id).execute())
-            except:
-                pass
             return {
                 "method": "sendMessage",
                 "chat_id": chat_id,
@@ -745,7 +739,7 @@ async def process_telegram_inline(chat_id, text, msg_info):
 
         # Check if user is registered and has phone + profile
         print(f"[TG] Checking user registration for {chat_id}...", flush=True)
-        user_check = await db(lambda: supabase.table("bot_users").select("phone_number, real_name, awaiting_name").eq("chat_id", chat_id).execute())
+        user_check = await db(lambda c=chat_id: supabase.table("bot_users").select("phone_number, real_name, awaiting_name").eq("chat_id", c).execute())
         has_phone = len(user_check.data) > 0 and user_check.data[0].get("phone_number") is not None
         tg_real_name = user_check.data[0].get("real_name", "") or "" if user_check.data else ""
         tg_awaiting_name = user_check.data[0].get("awaiting_name", False) if user_check.data else False
@@ -767,9 +761,9 @@ async def process_telegram_inline(chat_id, text, msg_info):
             else:
                 if not tg_real_name:
                     try:
-                        await db(lambda: supabase.table("bot_users").update(
+                        await db(lambda c=chat_id: supabase.table("bot_users").update(
                             {"awaiting_name": True}
-                        ).eq("chat_id", chat_id).execute())
+                        ).eq("chat_id", c).execute())
                     except:
                         pass
                     return {
@@ -808,11 +802,11 @@ async def process_telegram_inline(chat_id, text, msg_info):
                 }
             try:
                 first_name = msg_info.get("from", {}).get("first_name", "")
-                await db(lambda: supabase.table("reviews").insert({
+                await db(lambda c=chat_id, fn=first_name, r=review_text: supabase.table("reviews").insert({
                     "platform": "telegram",
-                    "user_id": str(chat_id),
-                    "user_name": first_name,
-                    "review": review_text
+                    "user_id": str(c),
+                    "user_name": fn,
+                    "review": r
                 }).execute())
                 return {
                     "method": "sendMessage",
@@ -874,9 +868,9 @@ async def process_telegram_inline(chat_id, text, msg_info):
             submitted_name = text.strip()
             if 2 <= len(submitted_name) <= 50 and not submitted_name.startswith("/"):
                 try:
-                    await db(lambda n=submitted_name: supabase.table("bot_users").update(
+                    await db(lambda n=submitted_name, c=chat_id: supabase.table("bot_users").update(
                         {"real_name": n, "awaiting_name": False}
-                    ).eq("chat_id", chat_id).execute())
+                    ).eq("chat_id", c).execute())
                     tg_real_name = submitted_name
                     print(f"[TG] Saved real name '{submitted_name}' for {chat_id}", flush=True)
                 except Exception as e:
@@ -904,9 +898,9 @@ async def process_telegram_inline(chat_id, text, msg_info):
             # Ask at message 4 (give them time to interact first)
             if msg_count == 4:
                 try:
-                    await db(lambda: supabase.table("bot_users").update(
+                    await db(lambda c=chat_id: supabase.table("bot_users").update(
                         {"awaiting_name": True}
-                    ).eq("chat_id", chat_id).execute())
+                    ).eq("chat_id", c).execute())
                 except:
                     pass
                 return {
