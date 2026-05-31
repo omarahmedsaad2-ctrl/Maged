@@ -765,11 +765,24 @@ async def process_telegram_inline(chat_id, text, msg_info):
                     "reply_markup": keyboard
                 }
             else:
-                return {
-                    "method": "sendMessage",
-                    "chat_id": chat_id,
-                    "text": "Hi welcome back! 🎓\n\nFeel free to ask me anything about English, I'm always here to help you 😊"
-                }
+                if not tg_real_name:
+                    try:
+                        await db(lambda: supabase.table("bot_users").update(
+                            {"awaiting_name": True}
+                        ).eq("chat_id", chat_id).execute())
+                    except:
+                        pass
+                    return {
+                        "method": "sendMessage",
+                        "chat_id": chat_id,
+                        "text": "Hi welcome back! 🎓\n\nبس الأول، ممكن تقولي اسمك إيه عشان أعرف أكلمك بيه؟ 😊"
+                    }
+                else:
+                    return {
+                        "method": "sendMessage",
+                        "chat_id": chat_id,
+                        "text": f"Hi welcome back {tg_real_name}! 🎓\n\nFeel free to ask me anything about English, I'm always here to help you 😊"
+                    }
 
         if not has_phone:
             keyboard = {
@@ -878,6 +891,28 @@ async def process_telegram_inline(chat_id, text, msg_info):
                     "method": "sendMessage",
                     "chat_id": chat_id,
                     "text": "معلش يا فندم، ممكن تكتبلي اسمك الحقيقي عشان أعرف أكلمك بيه؟ 😊"
+                }
+
+        # If we still don't have a real name after several messages, ask once
+        if not tg_real_name and not tg_awaiting_name:
+            msg_count = 0
+            try:
+                count_result = await db(lambda: supabase.table("chat_history").select("id", count="exact").eq("chat_id", chat_id).execute())
+                msg_count = count_result.count or 0
+            except:
+                pass
+            # Ask at message 4 (give them time to interact first)
+            if msg_count == 4:
+                try:
+                    await db(lambda: supabase.table("bot_users").update(
+                        {"awaiting_name": True}
+                    ).eq("chat_id", chat_id).execute())
+                except:
+                    pass
+                return {
+                    "method": "sendMessage",
+                    "chat_id": chat_id,
+                    "text": "بالمناسبة يا فندم، ممكن تقولي اسمك إيه عشان أقدر أكلمك بيه؟ 😊"
                 }
 
         # Normal message — get RAG response (with user_name injection!)
