@@ -11,7 +11,6 @@ import time
 import sys
 import asyncio
 import httpx
-import requests  # kept only for supabase internal use
 
 def clean_name(text):
     """Extract actual name from phrases like 'اسمي عمر' or 'my name is omar'"""
