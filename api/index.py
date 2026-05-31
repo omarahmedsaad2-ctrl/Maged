@@ -244,9 +244,10 @@ async def run_sync_logic(chat_id=None):
 
 
 # --- Send Functions (all async with retry + hard timeouts) ---
-async def _tg_post(url, json_data, timeout=30):
-    """POST to Telegram API with a hard asyncio timeout."""
-    return await asyncio.wait_for(_client.post(url, json=json_data), timeout=timeout)
+async def _tg_post(url, json_data, timeout=15):
+    """POST to Telegram API using a fresh client to prevent deadlocks."""
+    async with httpx.AsyncClient(verify=False) as client:
+        return await client.post(url, json=json_data, timeout=timeout)
 
 
 async def send_telegram(chat_id, text):
@@ -366,31 +367,35 @@ async def send_whatsapp(to_phone, text):
 
 
 async def broadcast_update():
-    """Broadcast an update message to all Telegram and WhatsApp users."""
+    """Broadcast an update message to all Telegram and WhatsApp users concurrently."""
     message = "تم تحديث البوت بميزات جديدة وأصبح أسرع وأذكى! 🚀\nنعتذر إذا قمت بإرسال رسالة في آخر 5 دقائق ولم يتم الرد عليها بسبب التحديث، يمكنك إعادة إرسالها الآن. 😊"
     
-    # 1. Telegram Users
-    try:
-        tg_users = await db(lambda: supabase.table("bot_users").select("chat_id").execute())
-        if tg_users.data:
-            print(f"[BROADCAST] Sending to {len(tg_users.data)} Telegram users...", flush=True)
-            for u in tg_users.data:
-                await send_telegram(u["chat_id"], message)
-                await asyncio.sleep(0.05)
-    except Exception as e:
-        print(f"[BROADCAST] Telegram error: {e}", flush=True)
-        
-    # 2. WhatsApp Users
-    try:
-        wa_users = await db(lambda: supabase.table("whatsapp_users").select("phone_number").execute())
-        if wa_users.data:
-            print(f"[BROADCAST] Sending to {len(wa_users.data)} WhatsApp users...", flush=True)
-            for u in wa_users.data:
-                await send_whatsapp(u["phone_number"], message)
-                await asyncio.sleep(0.05)
-    except Exception as e:
-        print(f"[BROADCAST] WhatsApp error: {e}", flush=True)
-    
+    async def send_tg():
+        try:
+            tg_users = await db(lambda: supabase.table("bot_users").select("chat_id").execute())
+            if tg_users.data:
+                print(f"[BROADCAST] Sending to {len(tg_users.data)} Telegram users...", flush=True)
+                # Create a task for each user and run concurrently with max concurrency
+                tasks = []
+                for u in tg_users.data:
+                    tasks.append(send_telegram(u["chat_id"], message))
+                await asyncio.gather(*tasks, return_exceptions=True)
+        except Exception as e:
+            print(f"[BROADCAST] Telegram error: {e}", flush=True)
+            
+    async def send_wa():
+        try:
+            wa_users = await db(lambda: supabase.table("whatsapp_users").select("phone_number").execute())
+            if wa_users.data:
+                print(f"[BROADCAST] Sending to {len(wa_users.data)} WhatsApp users...", flush=True)
+                tasks = []
+                for u in wa_users.data:
+                    tasks.append(send_whatsapp(u["phone_number"], message))
+                await asyncio.gather(*tasks, return_exceptions=True)
+        except Exception as e:
+            print(f"[BROADCAST] WhatsApp error: {e}", flush=True)
+            
+    await asyncio.gather(send_tg(), send_wa())
     print("[BROADCAST] Finished sending update messages.", flush=True)
 
 
